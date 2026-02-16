@@ -1,0 +1,22 @@
+{
+  "name": "@dac-cloud/worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "dev": "npx tsx src/index.ts",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@dac-cloud/shared": "*",
+    "ws": "^8.18.0",
+    "nanoid": "^5.0.9",
+    "pino": "^9.6.0",
+    "dotenv": "^16.4.7"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.5.14"
+  }
+}

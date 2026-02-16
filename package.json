@@ -1,0 +1,24 @@
+{
+  "name": "dac-cloud",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "packages/shared",
+    "packages/orchestrator",
+    "packages/worker"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces",
+    "build:shared": "npm run build -w packages/shared",
+    "build:orchestrator": "npm run build -w packages/orchestrator",
+    "build:worker": "npm run build -w packages/worker",
+    "dev:orchestrator": "npx tsx packages/orchestrator/src/index.ts",
+    "dev:worker": "npx tsx packages/worker/src/index.ts",
+    "typecheck": "npx tsc --noEmit -p packages/shared/tsconfig.json && npx tsc --noEmit -p packages/orchestrator/tsconfig.json && npx tsc --noEmit -p packages/worker/tsconfig.json"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "tsx": "^4.19.0",
+    "@types/node": "^22.0.0"
+  }
+}
