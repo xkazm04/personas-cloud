@@ -1,12 +1,14 @@
 import http from 'node:http';
 import { nanoid } from 'nanoid';
-import type { ExecRequest } from '@dac-cloud/shared';
-import type { Auth } from './auth.js';
+import type { ExecRequest, Persona, PersonaToolDefinition } from '@dac-cloud/shared';
+import type Database from 'better-sqlite3';
+import type { Auth, RequestContext } from './auth.js';
 import type { Dispatcher } from './dispatcher.js';
 import type { WorkerPool } from './workerPool.js';
 import type { TokenManager } from './tokenManager.js';
 import type { OAuthManager } from './oauth.js';
 import type { Logger } from 'pino';
+import * as db from './db.js';
 
 export function createHttpApi(
   auth: Auth,
@@ -15,12 +17,13 @@ export function createHttpApi(
   tokenManager: TokenManager,
   oauth: OAuthManager,
   logger: Logger,
+  database?: Database.Database,
 ): http.Server {
   const server = http.createServer(async (req, res) => {
     // CORS headers
     res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-User-Token');
 
     if (req.method === 'OPTIONS') {
       res.writeHead(204);
@@ -29,51 +32,265 @@ export function createHttpApi(
     }
 
     const url = req.url || '/';
+    const [pathname, queryString] = url.split('?');
 
     // Unauthenticated endpoints
-    if (url === '/health' && req.method === 'GET') {
+    if (pathname === '/health' && req.method === 'GET') {
       handleHealth(res, pool, oauth);
       return;
     }
 
-    // Auth check for everything else
-    if (!auth.validateRequest(req)) {
+    // Auth check for everything else — dual auth (API key + optional JWT)
+    const ctx = auth.validateAndExtractContext(req);
+    if (!ctx) {
       res.writeHead(401, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Unauthorized' }));
       return;
     }
 
+    // Helper: project scoping (admin sees all, user sees own project)
+    const scopedProjectId = ctx.authType === 'admin' ? undefined : ctx.projectId;
+
     try {
       // --- OAuth endpoints ---
-      if (url === '/api/oauth/authorize' && req.method === 'POST') {
+      if (pathname === '/api/oauth/authorize' && req.method === 'POST') {
         handleOAuthAuthorize(res, oauth);
-      } else if (url === '/api/oauth/callback' && req.method === 'POST') {
+      } else if (pathname === '/api/oauth/callback' && req.method === 'POST') {
         await handleOAuthCallback(req, res, oauth, tokenManager, logger);
-      } else if (url === '/api/oauth/status' && req.method === 'GET') {
+      } else if (pathname === '/api/oauth/status' && req.method === 'GET') {
         handleOAuthStatus(res, oauth);
-      } else if (url === '/api/oauth/refresh' && req.method === 'POST') {
+      } else if (pathname === '/api/oauth/refresh' && req.method === 'POST') {
         await handleOAuthRefresh(res, oauth, tokenManager, logger);
-      } else if (url === '/api/oauth/disconnect' && req.method === 'DELETE') {
+      } else if (pathname === '/api/oauth/disconnect' && req.method === 'DELETE') {
         handleOAuthDisconnect(res, oauth, tokenManager);
       }
       // --- Token injection (fallback for setup-token / direct paste) ---
-      else if (url === '/api/token' && req.method === 'POST') {
+      else if (pathname === '/api/token' && req.method === 'POST') {
         await handleSetToken(req, res, tokenManager, logger);
       }
-      // --- Execution endpoints ---
-      else if (url === '/api/status' && req.method === 'GET') {
+      // --- Persona CRUD ---
+      else if (pathname === '/api/personas' && req.method === 'GET' && database) {
+        json(res, 200, db.listPersonas(database, scopedProjectId));
+      } else if (pathname === '/api/personas' && req.method === 'POST' && database) {
+        const body = JSON.parse(await readBody(req)) as Partial<Persona>;
+        const now = new Date().toISOString();
+        const persona: Persona = {
+          id: body.id ?? nanoid(),
+          projectId: ctx.authType === 'user' ? ctx.projectId : (body.projectId ?? 'default'),
+          name: body.name ?? 'Untitled',
+          description: body.description ?? null,
+          systemPrompt: body.systemPrompt ?? '',
+          structuredPrompt: body.structuredPrompt ?? null,
+          icon: body.icon ?? null,
+          color: body.color ?? null,
+          enabled: body.enabled ?? true,
+          maxConcurrent: body.maxConcurrent ?? 1,
+          timeoutMs: body.timeoutMs ?? 300_000,
+          modelProfile: body.modelProfile ?? null,
+          maxBudgetUsd: body.maxBudgetUsd ?? null,
+          maxTurns: body.maxTurns ?? null,
+          designContext: body.designContext ?? null,
+          groupId: body.groupId ?? null,
+          createdAt: body.createdAt ?? now,
+          updatedAt: now,
+        };
+        db.upsertPersona(database, persona);
+        json(res, 201, persona);
+      } else if (matchRoute(pathname, '/api/personas/') && req.method === 'GET' && database) {
+        const id = pathname!.replace('/api/personas/', '');
+        const persona = db.getPersona(database, id);
+        if (!persona || (scopedProjectId && persona.projectId !== scopedProjectId)) { json(res, 404, { error: 'Not found' }); return; }
+        json(res, 200, persona);
+      } else if (matchRoute(pathname, '/api/personas/') && pathname!.endsWith('/tools') && req.method === 'GET' && database) {
+        const id = pathname!.replace('/api/personas/', '').replace('/tools', '');
+        json(res, 200, db.getToolsForPersona(database, id));
+      } else if (matchRoute(pathname, '/api/personas/') && pathname!.endsWith('/tools') && req.method === 'POST' && database) {
+        const id = pathname!.replace('/api/personas/', '').replace('/tools', '');
+        const body = JSON.parse(await readBody(req)) as { toolId: string };
+        db.linkTool(database, id, body.toolId);
+        json(res, 200, { linked: true });
+      } else if (matchRoute(pathname, '/api/personas/') && !pathname!.endsWith('/tools') && !pathname!.endsWith('/credentials') && !pathname!.endsWith('/subscriptions') && !pathname!.endsWith('/triggers') && req.method === 'DELETE' && database) {
+        const id = pathname!.replace('/api/personas/', '');
+        db.deletePersona(database, id, scopedProjectId);
+        json(res, 200, { deleted: true });
+      }
+      // --- Tool Definitions ---
+      else if (pathname === '/api/tool-definitions' && req.method === 'POST' && database) {
+        const body = JSON.parse(await readBody(req)) as Partial<PersonaToolDefinition>;
+        const now = new Date().toISOString();
+        const tool: PersonaToolDefinition = {
+          id: body.id ?? nanoid(),
+          name: body.name ?? 'unnamed',
+          category: body.category ?? 'general',
+          description: body.description ?? '',
+          scriptPath: body.scriptPath ?? '',
+          inputSchema: body.inputSchema ?? null,
+          outputSchema: body.outputSchema ?? null,
+          requiresCredentialType: body.requiresCredentialType ?? null,
+          implementationGuide: body.implementationGuide ?? null,
+          isBuiltin: body.isBuiltin ?? false,
+          createdAt: body.createdAt ?? now,
+          updatedAt: now,
+        };
+        db.upsertToolDefinition(database, tool);
+        json(res, 201, tool);
+      }
+      // --- Credentials ---
+      else if (pathname === '/api/credentials' && req.method === 'POST' && database) {
+        const body = JSON.parse(await readBody(req));
+        if (ctx.authType === 'user') body.projectId = ctx.projectId;
+        const cred = db.createCredential(database, body);
+        json(res, 201, cred);
+      } else if (matchRoute(pathname, '/api/credentials/') && req.method === 'DELETE' && database) {
+        const id = pathname!.replace('/api/credentials/', '');
+        db.deleteCredential(database, id);
+        json(res, 200, { deleted: true });
+      } else if (matchRoute(pathname, '/api/personas/') && pathname!.endsWith('/credentials') && req.method === 'GET' && database) {
+        const id = pathname!.replace('/api/personas/', '').replace('/credentials', '');
+        const creds = db.listCredentialsForPersona(database, id);
+        // Strip encrypted data from response
+        json(res, 200, creds.map(c => ({ ...c, encryptedData: '[REDACTED]', iv: '[REDACTED]', tag: '[REDACTED]' })));
+      } else if (matchRoute(pathname, '/api/personas/') && pathname!.endsWith('/credentials') && req.method === 'POST' && database) {
+        const id = pathname!.replace('/api/personas/', '').replace('/credentials', '');
+        const body = JSON.parse(await readBody(req)) as { credentialId: string };
+        db.linkCredential(database, id, body.credentialId);
+        json(res, 200, { linked: true });
+      }
+      // --- Event Subscriptions ---
+      else if (pathname === '/api/subscriptions' && req.method === 'POST' && database) {
+        const body = JSON.parse(await readBody(req));
+        if (ctx.authType === 'user') body.projectId = ctx.projectId;
+        const sub = db.createSubscription(database, body);
+        json(res, 201, sub);
+      } else if (matchRoute(pathname, '/api/subscriptions/') && req.method === 'PUT' && database) {
+        const id = pathname!.replace('/api/subscriptions/', '');
+        const body = JSON.parse(await readBody(req));
+        db.updateSubscription(database, id, body);
+        const updated = db.getSubscription(database, id);
+        json(res, 200, updated);
+      } else if (matchRoute(pathname, '/api/subscriptions/') && req.method === 'DELETE' && database) {
+        const id = pathname!.replace('/api/subscriptions/', '');
+        db.deleteSubscription(database, id);
+        json(res, 200, { deleted: true });
+      } else if (matchRoute(pathname, '/api/personas/') && pathname!.endsWith('/subscriptions') && req.method === 'GET' && database) {
+        const id = pathname!.replace('/api/personas/', '').replace('/subscriptions', '');
+        json(res, 200, db.listSubscriptionsForPersona(database, id));
+      }
+      // --- Triggers ---
+      else if (pathname === '/api/triggers' && req.method === 'POST' && database) {
+        const body = JSON.parse(await readBody(req));
+        if (ctx.authType === 'user') body.projectId = ctx.projectId;
+        const trigger = db.createTrigger(database, body);
+        json(res, 201, trigger);
+      } else if (matchRoute(pathname, '/api/triggers/') && req.method === 'PUT' && database) {
+        const id = pathname!.replace('/api/triggers/', '');
+        const body = JSON.parse(await readBody(req));
+        db.updateTrigger(database, id, body);
+        const updated = db.getTrigger(database, id);
+        json(res, 200, updated);
+      } else if (matchRoute(pathname, '/api/triggers/') && req.method === 'DELETE' && database) {
+        const id = pathname!.replace('/api/triggers/', '');
+        db.deleteTrigger(database, id);
+        json(res, 200, { deleted: true });
+      } else if (matchRoute(pathname, '/api/personas/') && pathname!.endsWith('/triggers') && req.method === 'GET' && database) {
+        const id = pathname!.replace('/api/personas/', '').replace('/triggers', '');
+        json(res, 200, db.listTriggersForPersona(database, id));
+      }
+      // --- Events ---
+      else if (pathname === '/api/events' && req.method === 'GET' && database) {
+        const params = new URLSearchParams(queryString || '');
+        const events = db.listEvents(database, {
+          eventType: params.get('eventType') ?? undefined,
+          status: params.get('status') ?? undefined,
+          limit: params.get('limit') ? parseInt(params.get('limit')!, 10) : 50,
+          offset: params.get('offset') ? parseInt(params.get('offset')!, 10) : undefined,
+          projectId: scopedProjectId,
+        });
+        json(res, 200, events);
+      } else if (pathname === '/api/events' && req.method === 'POST' && database) {
+        const body = JSON.parse(await readBody(req));
+        if (ctx.authType === 'user') body.projectId = ctx.projectId;
+        const event = db.publishEvent(database, body);
+        json(res, 201, event);
+      } else if (matchRoute(pathname, '/api/events/') && req.method === 'PUT' && database) {
+        const id = pathname!.replace('/api/events/', '');
+        const body = JSON.parse(await readBody(req)) as { status: string; metadata?: string };
+        const updated = db.updateEventWithMetadata(database, id, body.status, body.metadata);
+        if (updated) {
+          json(res, 200, updated);
+        } else {
+          res.writeHead(404, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Event not found' }));
+        }
+      }
+      // --- Webhooks ---
+      else if (matchRoute(pathname, '/api/webhooks/') && req.method === 'POST' && database) {
+        const personaId = pathname!.replace('/api/webhooks/', '');
+        const body = await readBody(req);
+        const event = db.publishEvent(database, {
+          eventType: 'webhook_received',
+          sourceType: 'webhook',
+          sourceId: personaId,
+          targetPersonaId: personaId,
+          payload: body,
+        });
+        json(res, 201, event);
+      }
+      // --- GitLab Webhook ---
+      else if (pathname === '/api/gitlab/webhook' && req.method === 'POST' && database) {
+        const body = await readBody(req);
+        let parsed: Record<string, unknown> = {};
+        try { parsed = JSON.parse(body); } catch { /* raw payload */ }
+        const objectKind = (parsed['object_kind'] as string) || 'unknown';
+        const projectPath = (parsed['project'] as Record<string, unknown>)?.['path_with_namespace'] as string | undefined;
+        const event = db.publishEvent(database, {
+          eventType: `gitlab_${objectKind}`,
+          sourceType: 'gitlab',
+          sourceId: projectPath ?? null,
+          payload: body,
+        });
+        json(res, 201, event);
+      }
+      // --- Executions ---
+      else if (pathname === '/api/executions' && req.method === 'GET' && database) {
+        const params = new URLSearchParams(queryString || '');
+        const executions = db.listExecutions(database, {
+          personaId: params.get('personaId') ?? undefined,
+          status: params.get('status') ?? undefined,
+          limit: params.get('limit') ? parseInt(params.get('limit')!, 10) : 50,
+          offset: params.get('offset') ? parseInt(params.get('offset')!, 10) : undefined,
+          projectId: scopedProjectId,
+        });
+        json(res, 200, executions);
+      }
+      // --- Existing execution endpoints ---
+      else if (pathname === '/api/status' && req.method === 'GET') {
         handleStatus(res, pool, dispatcher, tokenManager, oauth);
-      } else if (url === '/api/execute' && req.method === 'POST') {
-        await handleExecute(req, res, dispatcher, logger);
-      } else if (url.startsWith('/api/executions/') && url.endsWith('/cancel') && req.method === 'POST') {
-        const executionId = url.replace('/api/executions/', '').replace('/cancel', '');
+      } else if (pathname === '/api/execute' && req.method === 'POST') {
+        await handleExecute(req, res, dispatcher, logger, ctx);
+      } else if (matchRoute(pathname, '/api/executions/') && pathname!.endsWith('/cancel') && req.method === 'POST') {
+        const executionId = pathname!.replace('/api/executions/', '').replace('/cancel', '');
         handleCancelExecution(res, dispatcher, executionId || '');
-      } else if (url.startsWith('/api/executions/') && req.method === 'GET') {
-        const parts = url.split('?');
-        const executionId = (parts[0] || '').replace('/api/executions/', '');
-        const params = new URLSearchParams(parts[1] || '');
+      } else if (matchRoute(pathname, '/api/executions/') && req.method === 'GET') {
+        const executionId = pathname!.replace('/api/executions/', '');
+        const params = new URLSearchParams(queryString || '');
         const offset = parseInt(params.get('offset') || '0', 10);
         handleGetExecution(res, dispatcher, executionId, offset);
+      }
+      // --- Admin-only routes ---
+      else if (pathname === '/api/admin/users' && req.method === 'GET' && database) {
+        if (requireAdmin(ctx, res)) return;
+        json(res, 200, { projectIds: db.listDistinctProjectIds(database) });
+      } else if (pathname === '/api/admin/personas' && req.method === 'GET' && database) {
+        if (requireAdmin(ctx, res)) return;
+        json(res, 200, db.listPersonas(database));
+      } else if (pathname === '/api/admin/executions' && req.method === 'GET' && database) {
+        if (requireAdmin(ctx, res)) return;
+        const params = new URLSearchParams(queryString || '');
+        json(res, 200, db.listExecutions(database, {
+          limit: params.get('limit') ? parseInt(params.get('limit')!, 10) : 100,
+          offset: params.get('offset') ? parseInt(params.get('offset')!, 10) : undefined,
+        }));
       } else {
         res.writeHead(404, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'Not found' }));
@@ -91,6 +308,25 @@ export function createHttpApi(
   });
 
   return server;
+}
+
+function json(res: http.ServerResponse, status: number, data: unknown): void {
+  res.writeHead(status, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify(data));
+}
+
+function matchRoute(pathname: string | undefined, prefix: string): boolean {
+  return !!pathname && pathname.startsWith(prefix) && pathname.length > prefix.length;
+}
+
+/** Returns true (and sends 403) if the caller is NOT an admin. */
+function requireAdmin(ctx: RequestContext, res: http.ServerResponse): boolean {
+  if (ctx.authType !== 'admin') {
+    res.writeHead(403, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Admin access required' }));
+    return true;
+  }
+  return false;
 }
 
 // --- OAuth handlers ---
@@ -273,6 +509,7 @@ async function handleExecute(
   res: http.ServerResponse,
   dispatcher: Dispatcher,
   logger: Logger,
+  ctx?: RequestContext,
 ): Promise<void> {
   const body = await readBody(req);
   let parsed: { prompt?: string; personaId?: string; timeoutMs?: number };
@@ -295,6 +532,7 @@ async function handleExecute(
     executionId: nanoid(),
     personaId: parsed.personaId || 'manual',
     prompt: parsed.prompt,
+    projectId: ctx?.authType === 'user' ? ctx.projectId : undefined,
     config: {
       timeoutMs: parsed.timeoutMs || 300_000,
     },

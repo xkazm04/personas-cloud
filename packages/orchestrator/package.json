@@ -15,9 +15,11 @@
     "kafkajs": "^2.2.4",
     "nanoid": "^5.0.9",
     "pino": "^9.6.0",
-    "dotenv": "^16.4.7"
+    "dotenv": "^16.4.7",
+    "better-sqlite3": "^11.7.0"
   },
   "devDependencies": {
-    "@types/ws": "^8.5.14"
+    "@types/ws": "^8.5.14",
+    "@types/better-sqlite3": "^7.6.12"
   }
 }

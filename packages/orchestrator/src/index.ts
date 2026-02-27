@@ -1,3 +1,4 @@
+import path from 'node:path';
 import pino from 'pino';
 import { loadConfig } from './config.js';
 import { createAuth } from './auth.js';
@@ -7,6 +8,9 @@ import { WorkerPool } from './workerPool.js';
 import { createKafkaClient, createNoopKafkaClient } from './kafka.js';
 import { Dispatcher } from './dispatcher.js';
 import { createHttpApi } from './httpApi.js';
+import { initDb } from './db.js';
+import { startEventProcessor } from './eventProcessor.js';
+import { startTriggerScheduler } from './triggerScheduler.js';
 import { TOPICS, type ExecRequest } from '@dac-cloud/shared';
 
 const logger = pino({ level: process.env['LOG_LEVEL'] || 'info' });
@@ -24,7 +28,7 @@ async function main() {
   }, 'Configuration loaded');
 
   // Initialize components
-  const auth = createAuth(config.teamApiKey);
+  const auth = createAuth(config.teamApiKey, config.supabaseJwtSecret || undefined);
   const tokenManager = createTokenManager(config.masterKey, logger);
   const oauth = new OAuthManager(logger);
 
@@ -36,6 +40,10 @@ async function main() {
     logger.info('No direct Claude token — use OAuth flow via POST /api/oauth/authorize');
   }
 
+  // Database
+  const dbPath = process.env['DAC_DB_PATH'] || path.join(process.cwd(), 'data', 'personas.db');
+  const database = initDb(dbPath, logger);
+
   // Worker pool (WebSocket server)
   const pool = new WorkerPool(config.workerToken, logger);
 
@@ -46,6 +54,8 @@ async function main() {
 
   // Dispatcher — uses OAuth manager for token refresh
   const dispatcher = new Dispatcher(pool, tokenManager, oauth, kafka, logger);
+  dispatcher.setDatabase(database);
+  dispatcher.setMasterKey(config.masterKey);
 
   // Connect Kafka
   if (config.kafkaEnabled) {
@@ -67,11 +77,15 @@ async function main() {
   // Start WebSocket server for workers
   pool.listen(config.wsPort);
 
-  // Start HTTP API (now includes OAuth endpoints)
-  const httpServer = createHttpApi(auth, dispatcher, pool, tokenManager, oauth, logger);
+  // Start HTTP API (now includes OAuth endpoints + persona CRUD)
+  const httpServer = createHttpApi(auth, dispatcher, pool, tokenManager, oauth, logger, database);
   httpServer.listen(config.httpPort, () => {
     logger.info({ port: config.httpPort }, 'HTTP API listening');
   });
+
+  // Start event processor (2s tick) and trigger scheduler (5s tick)
+  const eventProcessorTimer = startEventProcessor(database, dispatcher, logger);
+  const triggerSchedulerTimer = startTriggerScheduler(database, logger);
 
   // Token refresh loop — refresh OAuth token proactively every 30 minutes
   setInterval(async () => {
@@ -100,10 +114,13 @@ async function main() {
   // Graceful shutdown
   const shutdown = async () => {
     logger.info('Shutting down...');
+    clearInterval(eventProcessorTimer);
+    clearInterval(triggerSchedulerTimer);
     dispatcher.shutdown();
     pool.shutdown();
     await kafka.disconnect();
     httpServer.close();
+    database.close();
     process.exit(0);
   };
 

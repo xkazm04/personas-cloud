@@ -9,6 +9,7 @@ export interface OrchestratorConfig {
   kafkaUsername: string;
   kafkaPassword: string;
   kafkaEnabled: boolean;
+  supabaseJwtSecret: string;
   wsPort: number;
   httpPort: number;
 }
@@ -37,6 +38,7 @@ export function loadConfig(): OrchestratorConfig {
     kafkaUsername: process.env['KAFKA_USERNAME'] || '',
     kafkaPassword: process.env['KAFKA_PASSWORD'] || '',
     kafkaEnabled: kafkaBrokers.length > 0,
+    supabaseJwtSecret: process.env['SUPABASE_JWT_SECRET'] || '',
     wsPort: parseInt(optional('WS_PORT', '8443'), 10),
     httpPort: parseInt(optional('HTTP_PORT', '3001'), 10),
   };
