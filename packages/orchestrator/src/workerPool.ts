@@ -1,8 +1,11 @@
 import { WebSocketServer, WebSocket } from 'ws';
+import { timingSafeEqual } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import {
   parseMessage,
   serializeMessage,
+  PROTOCOL_VERSION,
+  checkProtocolCompatibility,
   type WorkerMessage,
   type OrchestratorMessage,
   type ExecAssign,
@@ -40,7 +43,11 @@ export class WorkerPool extends EventEmitter {
       // C3: Validate worker token from query string (?token=...)
       const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
       const token = url.searchParams.get('token');
-      if (!token || token !== this.expectedWorkerToken) {
+      if (
+        !token
+        || token.length !== this.expectedWorkerToken.length
+        || !timingSafeEqual(Buffer.from(token), Buffer.from(this.expectedWorkerToken))
+      ) {
         this.logger.warn({ remoteAddr: req.socket.remoteAddress }, 'Worker rejected: invalid token');
         ws.close(1008, 'Invalid worker token');
         return;
@@ -101,6 +108,23 @@ export class WorkerPool extends EventEmitter {
   }
 
   private registerWorker(workerId: string, ws: WebSocket, version: string, capabilities: string[]): void {
+    // Validate protocol version compatibility
+    const compat = checkProtocolCompatibility(version);
+    if (compat === 'incompatible' || compat === 'invalid') {
+      this.logger.error(
+        { workerId, workerVersion: version, orchestratorVersion: PROTOCOL_VERSION },
+        'Worker rejected: incompatible protocol version',
+      );
+      ws.close(1008, `Incompatible protocol version: worker=${version}, orchestrator=${PROTOCOL_VERSION}`);
+      return;
+    }
+    if (compat === 'warn') {
+      this.logger.warn(
+        { workerId, workerVersion: version, orchestratorVersion: PROTOCOL_VERSION },
+        'Worker protocol version mismatch (near-compatible) — consider upgrading',
+      );
+    }
+
     // I10: If a worker with this ID already exists, disconnect the old one first
     const existing = this.workers.get(workerId);
     if (existing) {
@@ -134,11 +158,12 @@ export class WorkerPool extends EventEmitter {
 
     this.workers.set(workerId, { ws, info, heartbeatTimer });
 
-    // Send ack
+    // Send ack with orchestrator's protocol version
     this.send(workerId, {
       type: 'ack',
       workerId,
       sessionToken: `session-${Date.now()}`,
+      protocolVersion: PROTOCOL_VERSION,
     });
 
     this.logger.info({ workerId, version, capabilities }, 'Worker registered');

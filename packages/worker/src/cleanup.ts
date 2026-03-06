@@ -84,9 +84,42 @@ export function writeClaudeCredentials(accessToken: string, logger: Logger): voi
       scopes: ['user:inference', 'user:profile'],
     };
 
-    fs.writeFileSync(credentialsPath, JSON.stringify(creds));
+    fs.writeFileSync(credentialsPath, JSON.stringify(creds), { mode: 0o600 });
+
+    // Ensure owner-only permissions even if the file already existed
+    if (process.platform !== 'win32') {
+      fs.chmodSync(credentialsPath, 0o600);
+    }
+
     logger.info('Wrote OAuth credentials to ~/.claude/.credentials.json');
   } catch (err) {
     logger.warn({ err }, 'Failed to write Claude credentials');
+  }
+}
+
+/**
+ * Remove the OAuth token from ~/.claude/.credentials.json after execution.
+ * This prevents stale tokens from persisting on disk between executions.
+ */
+export function clearClaudeCredentials(logger: Logger): void {
+  const home = process.env['HOME'] || process.env['USERPROFILE'] || '/root';
+  const credentialsPath = path.join(home, '.claude', '.credentials.json');
+
+  try {
+    if (!fs.existsSync(credentialsPath)) return;
+
+    const content = fs.readFileSync(credentialsPath, 'utf8');
+    const creds: Record<string, unknown> = JSON.parse(content);
+
+    if ('claudeAiOauth' in creds) {
+      delete creds['claudeAiOauth'];
+      fs.writeFileSync(credentialsPath, JSON.stringify(creds), { mode: 0o600 });
+      if (process.platform !== 'win32') {
+        fs.chmodSync(credentialsPath, 0o600);
+      }
+      logger.info('Cleared OAuth credentials from ~/.claude/.credentials.json');
+    }
+  } catch (err) {
+    logger.warn({ err }, 'Failed to clear Claude credentials');
   }
 }

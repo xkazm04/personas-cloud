@@ -78,7 +78,7 @@ async function main() {
   pool.listen(config.wsPort);
 
   // Start HTTP API (now includes OAuth endpoints + persona CRUD)
-  const httpServer = createHttpApi(auth, dispatcher, pool, tokenManager, oauth, logger, database);
+  const httpServer = createHttpApi(auth, dispatcher, pool, tokenManager, oauth, logger, database, config.gitlabWebhookSecret || undefined, config.corsOrigins);
   httpServer.listen(config.httpPort, () => {
     logger.info({ port: config.httpPort }, 'HTTP API listening');
   });

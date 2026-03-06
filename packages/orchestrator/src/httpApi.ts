@@ -1,4 +1,5 @@
 import http from 'node:http';
+import { timingSafeEqual } from 'node:crypto';
 import { nanoid } from 'nanoid';
 import type { ExecRequest, Persona, PersonaToolDefinition } from '@dac-cloud/shared';
 import type Database from 'better-sqlite3';
@@ -18,10 +19,18 @@ export function createHttpApi(
   oauth: OAuthManager,
   logger: Logger,
   database?: Database.Database,
+  gitlabWebhookSecret?: string,
+  corsOrigins?: string[],
 ): http.Server {
+  const allowedOrigins = new Set(corsOrigins ?? []);
+
   const server = http.createServer(async (req, res) => {
-    // CORS headers
-    res.setHeader('Access-Control-Allow-Origin', '*');
+    // CORS headers — only allow explicitly configured origins
+    const requestOrigin = req.headers['origin'];
+    if (requestOrigin && allowedOrigins.has(requestOrigin)) {
+      res.setHeader('Access-Control-Allow-Origin', requestOrigin);
+      res.setHeader('Vary', 'Origin');
+    }
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-User-Token');
 
@@ -37,6 +46,37 @@ export function createHttpApi(
     // Unauthenticated endpoints
     if (pathname === '/health' && req.method === 'GET') {
       handleHealth(res, pool, oauth);
+      return;
+    }
+
+    // GitLab webhook — verified via X-Gitlab-Token (not API key auth)
+    if (pathname === '/api/gitlab/webhook' && req.method === 'POST' && database) {
+      if (!gitlabWebhookSecret) {
+        logger.warn('GitLab webhook received but GITLAB_WEBHOOK_SECRET is not configured');
+        res.writeHead(403, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'GitLab webhook secret not configured' }));
+        return;
+      }
+
+      const token = req.headers['x-gitlab-token'] as string | undefined;
+      if (!token || !safeCompareTokens(token, gitlabWebhookSecret)) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Invalid or missing X-Gitlab-Token' }));
+        return;
+      }
+
+      const body = await readBody(req);
+      let parsed: Record<string, unknown> = {};
+      try { parsed = JSON.parse(body); } catch { /* raw payload */ }
+      const objectKind = (parsed['object_kind'] as string) || 'unknown';
+      const projectPath = (parsed['project'] as Record<string, unknown>)?.['path_with_namespace'] as string | undefined;
+      const event = db.publishEvent(database, {
+        eventType: `gitlab_${objectKind}`,
+        sourceType: 'gitlab',
+        sourceId: projectPath ?? null,
+        payload: body,
+      });
+      json(res, 201, event);
       return;
     }
 
@@ -73,6 +113,12 @@ export function createHttpApi(
         json(res, 200, db.listPersonas(database, scopedProjectId));
       } else if (pathname === '/api/personas' && req.method === 'POST' && database) {
         const body = JSON.parse(await readBody(req)) as Partial<Persona>;
+        const promptError = validatePromptFields(body);
+        if (promptError) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: promptError }));
+          return;
+        }
         const now = new Date().toISOString();
         const persona: Persona = {
           id: body.id ?? nanoid(),
@@ -202,8 +248,8 @@ export function createHttpApi(
         const events = db.listEvents(database, {
           eventType: params.get('eventType') ?? undefined,
           status: params.get('status') ?? undefined,
-          limit: params.get('limit') ? parseInt(params.get('limit')!, 10) : 50,
-          offset: params.get('offset') ? parseInt(params.get('offset')!, 10) : undefined,
+          limit: clampInt(params.get('limit'), 50, 1, MAX_LIMIT),
+          offset: clampInt(params.get('offset'), 0, 0, Number.MAX_SAFE_INTEGER),
           projectId: scopedProjectId,
         });
         json(res, 200, events);
@@ -236,29 +282,14 @@ export function createHttpApi(
         });
         json(res, 201, event);
       }
-      // --- GitLab Webhook ---
-      else if (pathname === '/api/gitlab/webhook' && req.method === 'POST' && database) {
-        const body = await readBody(req);
-        let parsed: Record<string, unknown> = {};
-        try { parsed = JSON.parse(body); } catch { /* raw payload */ }
-        const objectKind = (parsed['object_kind'] as string) || 'unknown';
-        const projectPath = (parsed['project'] as Record<string, unknown>)?.['path_with_namespace'] as string | undefined;
-        const event = db.publishEvent(database, {
-          eventType: `gitlab_${objectKind}`,
-          sourceType: 'gitlab',
-          sourceId: projectPath ?? null,
-          payload: body,
-        });
-        json(res, 201, event);
-      }
       // --- Executions ---
       else if (pathname === '/api/executions' && req.method === 'GET' && database) {
         const params = new URLSearchParams(queryString || '');
         const executions = db.listExecutions(database, {
           personaId: params.get('personaId') ?? undefined,
           status: params.get('status') ?? undefined,
-          limit: params.get('limit') ? parseInt(params.get('limit')!, 10) : 50,
-          offset: params.get('offset') ? parseInt(params.get('offset')!, 10) : undefined,
+          limit: clampInt(params.get('limit'), 50, 1, MAX_LIMIT),
+          offset: clampInt(params.get('offset'), 0, 0, Number.MAX_SAFE_INTEGER),
           projectId: scopedProjectId,
         });
         json(res, 200, executions);
@@ -274,7 +305,7 @@ export function createHttpApi(
       } else if (matchRoute(pathname, '/api/executions/') && req.method === 'GET') {
         const executionId = pathname!.replace('/api/executions/', '');
         const params = new URLSearchParams(queryString || '');
-        const offset = parseInt(params.get('offset') || '0', 10);
+        const offset = clampInt(params.get('offset'), 0, 0, Number.MAX_SAFE_INTEGER);
         handleGetExecution(res, dispatcher, executionId, offset);
       }
       // --- Admin-only routes ---
@@ -288,8 +319,8 @@ export function createHttpApi(
         if (requireAdmin(ctx, res)) return;
         const params = new URLSearchParams(queryString || '');
         json(res, 200, db.listExecutions(database, {
-          limit: params.get('limit') ? parseInt(params.get('limit')!, 10) : 100,
-          offset: params.get('offset') ? parseInt(params.get('offset')!, 10) : undefined,
+          limit: clampInt(params.get('limit'), 100, 1, MAX_LIMIT),
+          offset: clampInt(params.get('offset'), 0, 0, Number.MAX_SAFE_INTEGER),
         }));
       } else {
         res.writeHead(404, { 'Content-Type': 'application/json' });
@@ -534,7 +565,7 @@ async function handleExecute(
     prompt: parsed.prompt,
     projectId: ctx?.authType === 'user' ? ctx.projectId : undefined,
     config: {
-      timeoutMs: parsed.timeoutMs || 300_000,
+      timeoutMs: Math.max(1000, Math.min(MAX_TIMEOUT_MS, parsed.timeoutMs || MAX_TIMEOUT_MS)),
     },
   };
 
@@ -592,6 +623,47 @@ function handleCancelExecution(
 
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ executionId, status: 'cancelling' }));
+}
+
+/** Constant-time token comparison to prevent timing side-channel attacks. */
+function safeCompareTokens(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  return timingSafeEqual(Buffer.from(a), Buffer.from(b));
+}
+
+// --- Query parameter bounds ---
+
+const MAX_LIMIT = 1000;
+const MAX_TIMEOUT_MS = 120_000;
+
+/** Parse an integer query param, clamping it within [min, max]. */
+function clampInt(raw: string | null, fallback: number, min: number, max: number): number {
+  if (raw === null) return fallback;
+  const n = parseInt(raw, 10);
+  if (Number.isNaN(n)) return fallback;
+  return Math.max(min, Math.min(max, n));
+}
+
+// --- Prompt validation ---
+
+const MAX_PROMPT_BYTES = 50 * 1024; // 50 KB
+
+/** Regex matching null bytes and C0 control chars (U+0001-U+001F) except tab, newline, CR. */
+const DANGEROUS_CHARS = /[\x00-\x08\x0B\x0C\x0E-\x1F]/;
+
+function validatePromptFields(body: Partial<Persona>): string | null {
+  if (body.systemPrompt !== undefined && body.systemPrompt !== null) {
+    if (typeof body.systemPrompt !== 'string') return 'systemPrompt must be a string';
+    if (body.systemPrompt.length > MAX_PROMPT_BYTES) return `systemPrompt exceeds maximum size of ${MAX_PROMPT_BYTES / 1024} KB`;
+    if (DANGEROUS_CHARS.test(body.systemPrompt)) return 'systemPrompt contains invalid control characters';
+  }
+  if (body.structuredPrompt !== undefined && body.structuredPrompt !== null) {
+    if (typeof body.structuredPrompt !== 'string') return 'structuredPrompt must be a string';
+    if (body.structuredPrompt.length > MAX_PROMPT_BYTES) return `structuredPrompt exceeds maximum size of ${MAX_PROMPT_BYTES / 1024} KB`;
+    if (DANGEROUS_CHARS.test(body.structuredPrompt)) return 'structuredPrompt contains invalid control characters';
+    try { JSON.parse(body.structuredPrompt); } catch { return 'structuredPrompt must be valid JSON'; }
+  }
+  return null;
 }
 
 const MAX_BODY_BYTES = 1024 * 1024; // 1 MB

@@ -198,5 +198,32 @@ export const TOPICS = {
   DLQ: 'persona.dlq.v1',
 } as const;
 
-// Protocol version
-export const PROTOCOL_VERSION = '0.1.0';
+// Protocol version — bump major on breaking changes, minor on additive changes
+export const PROTOCOL_VERSION = '1.0.0';
+
+/** Parse a semver string into [major, minor, patch]. Returns null on invalid input. */
+export function parseSemver(version: string): [number, number, number] | null {
+  const m = /^(\d+)\.(\d+)\.(\d+)/.exec(version);
+  if (!m) return null;
+  return [Number(m[1]), Number(m[2]), Number(m[3])];
+}
+
+/**
+ * Check protocol version compatibility.
+ * - 'compatible': exact match or same major with higher/equal minor
+ * - 'warn': same major but different minor (near-compatible)
+ * - 'incompatible': different major version
+ * - 'invalid': could not parse version string
+ */
+export function checkProtocolCompatibility(
+  remote: string,
+  local: string = PROTOCOL_VERSION,
+): 'compatible' | 'warn' | 'incompatible' | 'invalid' {
+  const r = parseSemver(remote);
+  const l = parseSemver(local);
+  if (!r || !l) return 'invalid';
+
+  if (r[0] !== l[0]) return 'incompatible';
+  if (r[1] !== l[1]) return 'warn';
+  return 'compatible';
+}

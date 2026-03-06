@@ -10,6 +10,8 @@ export interface OrchestratorConfig {
   kafkaPassword: string;
   kafkaEnabled: boolean;
   supabaseJwtSecret: string;
+  gitlabWebhookSecret: string;
+  corsOrigins: string[];
   wsPort: number;
   httpPort: number;
 }
@@ -39,6 +41,8 @@ export function loadConfig(): OrchestratorConfig {
     kafkaPassword: process.env['KAFKA_PASSWORD'] || '',
     kafkaEnabled: kafkaBrokers.length > 0,
     supabaseJwtSecret: process.env['SUPABASE_JWT_SECRET'] || '',
+    gitlabWebhookSecret: process.env['GITLAB_WEBHOOK_SECRET'] || '',
+    corsOrigins: (process.env['CORS_ORIGINS'] || '').split(',').map(s => s.trim()).filter(Boolean),
     wsPort: parseInt(optional('WS_PORT', '8443'), 10),
     httpPort: parseInt(optional('HTTP_PORT', '3001'), 10),
   };

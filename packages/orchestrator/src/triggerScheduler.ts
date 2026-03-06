@@ -2,6 +2,9 @@ import type Database from 'better-sqlite3';
 import type { Logger } from 'pino';
 import * as db from './db.js';
 
+/** Minimum allowed interval between trigger firings (60 seconds). */
+const MIN_INTERVAL_MS = 60_000;
+
 /**
  * Start the trigger scheduler loop.
  * Ported from desktop engine/background.rs::trigger_scheduler_tick().
@@ -80,7 +83,8 @@ function triggerSchedulerTick(
           if (config.cron) {
             nextTriggerAt = computeNextCron(config.cron);
           } else if (config.interval_seconds) {
-            const next = new Date(Date.now() + config.interval_seconds * 1000);
+            const intervalMs = Math.max(config.interval_seconds * 1000, MIN_INTERVAL_MS);
+            const next = new Date(Date.now() + intervalMs);
             nextTriggerAt = next.toISOString();
           }
         } catch {
@@ -106,6 +110,9 @@ function triggerSchedulerTick(
  * Simple cron next-time computation.
  * Supports basic interval-based patterns. For full cron support,
  * add cron-parser dependency later.
+ *
+ * All computed intervals are clamped to a minimum of MIN_INTERVAL_MS
+ * to prevent resource exhaustion via rapid-fire triggers.
  */
 function computeNextCron(cron: string): string | null {
   // Basic patterns: "every Xm", "every Xh", "every Xs"
@@ -114,7 +121,7 @@ function computeNextCron(cron: string): string | null {
     const value = parseInt(match[1]!, 10);
     const unit = match[2]!.toLowerCase();
     const multipliers: Record<string, number> = { s: 1000, m: 60000, h: 3600000, d: 86400000 };
-    const ms = value * (multipliers[unit] ?? 60000);
+    const ms = Math.max(value * (multipliers[unit] ?? 60000), MIN_INTERVAL_MS);
     return new Date(Date.now() + ms).toISOString();
   }
 

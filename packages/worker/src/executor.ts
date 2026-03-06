@@ -1,7 +1,7 @@
 import { spawn, execSync, type ChildProcess } from 'node:child_process';
 import type { ExecAssign } from '@dac-cloud/shared';
 import { LineBuffer, parseStreamLine, detectPersonaEvents } from './parser.js';
-import { createTempDir, cleanupTempDir, clearEnvVars, ensureClaudeConfig, writeClaudeCredentials } from './cleanup.js';
+import { createTempDir, cleanupTempDir, ensureClaudeConfig, writeClaudeCredentials, clearClaudeCredentials } from './cleanup.js';
 import type { Logger } from 'pino';
 
 /**
@@ -56,16 +56,6 @@ export class Executor {
       writeClaudeCredentials(oauthToken, this.logger);
     }
 
-    // Inject environment variables (except OAuth token which goes to credentials file)
-    const injectedKeys: string[] = [];
-    for (const [key, value] of Object.entries(assignment.env)) {
-      if (key === 'ANTHROPIC_API_KEY' && value.startsWith('sk-ant-oat')) {
-        continue; // Written to credentials file instead
-      }
-      process.env[key] = value;
-      injectedKeys.push(key);
-    }
-
     this.logger.info({
       executionId: assignment.executionId,
       personaId: assignment.personaId,
@@ -84,8 +74,16 @@ export class Executor {
 
       this.logger.info({ command, shell }, 'Resolved Claude CLI');
 
-      // Build child process environment — inherit current env (which now includes injected vars)
+      // Build child process environment — inherit current env, then inject
+      // credential vars directly into childEnv (never into process.env) to
+      // prevent cross-execution credential leakage.
       const childEnv = { ...process.env };
+      for (const [key, value] of Object.entries(assignment.env)) {
+        if (key === 'ANTHROPIC_API_KEY' && value.startsWith('sk-ant-oat')) {
+          continue; // Written to credentials file instead
+        }
+        childEnv[key] = value;
+      }
       // Unset CLAUDECODE to avoid "nested session" guard when running inside another Claude Code session
       delete childEnv['CLAUDECODE'];
       // Remove ANTHROPIC_API_KEY so CLI uses credentials file (OAuth) instead of API key auth
@@ -177,9 +175,9 @@ export class Executor {
       callbacks.onComplete(status, exitCode, durationMs, sessionId, totalCostUsd);
 
     } finally {
-      // Cleanup: remove env vars and temp directory
-      clearEnvVars(injectedKeys, this.logger);
+      // Cleanup: remove temp directory and clear persisted OAuth token
       cleanupTempDir(execDir, this.logger);
+      clearClaudeCredentials(this.logger);
       this.childProcess = null;
       this.killed = false;
     }

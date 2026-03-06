@@ -3,6 +3,7 @@ import {
   parseMessage,
   serializeMessage,
   PROTOCOL_VERSION,
+  checkProtocolCompatibility,
   type OrchestratorMessage,
   type WorkerMessage,
 } from '@dac-cloud/shared';
@@ -87,11 +88,27 @@ export class Connection {
 
   private handleMessage(msg: OrchestratorMessage): void {
     switch (msg.type) {
-      case 'ack':
-        this.logger.info({ workerId: msg.workerId }, 'Received ack from orchestrator');
+      case 'ack': {
+        const compat = checkProtocolCompatibility(msg.protocolVersion, PROTOCOL_VERSION);
+        if (compat === 'incompatible' || compat === 'invalid') {
+          this.logger.error(
+            { orchestratorVersion: msg.protocolVersion, workerVersion: PROTOCOL_VERSION },
+            'Orchestrator protocol version incompatible — disconnecting',
+          );
+          this.disconnect();
+          return;
+        }
+        if (compat === 'warn') {
+          this.logger.warn(
+            { orchestratorVersion: msg.protocolVersion, workerVersion: PROTOCOL_VERSION },
+            'Orchestrator protocol version mismatch (near-compatible) — consider upgrading',
+          );
+        }
+        this.logger.info({ workerId: msg.workerId, protocolVersion: msg.protocolVersion }, 'Received ack from orchestrator');
         // Send ready after ack
         this.sendReady();
         break;
+      }
 
       case 'assign':
         this.logger.info({ executionId: msg.executionId, personaId: msg.personaId }, 'Received execution assignment');

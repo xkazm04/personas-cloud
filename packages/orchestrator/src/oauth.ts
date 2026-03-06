@@ -25,6 +25,8 @@ export interface OAuthState {
 export class OAuthManager {
   private pendingState: OAuthState | null = null;
   private tokens: OAuthTokens | null = null;
+  /** In-flight refresh promise shared by concurrent callers. */
+  private refreshPromise: Promise<OAuthTokens | null> | null = null;
 
   constructor(private logger: Logger) {}
 
@@ -202,6 +204,8 @@ export class OAuthManager {
 
   /**
    * Get a valid access token, refreshing if necessary.
+   * Uses a pending-promise mutex so concurrent callers share a single
+   * in-flight refresh instead of racing against each other.
    * Returns null if no tokens available or refresh fails.
    */
   async getValidAccessToken(): Promise<string | null> {
@@ -210,8 +214,19 @@ export class OAuthManager {
     // Refresh if within 10 minutes of expiry
     const TEN_MINUTES = 10 * 60 * 1000;
     if (Date.now() > this.tokens.expiresAt - TEN_MINUTES) {
+      // If a refresh is already in-flight, wait for it instead of starting another
+      if (this.refreshPromise) {
+        this.logger.info('Token refresh already in-flight, waiting...');
+        const result = await this.refreshPromise;
+        if (!result) return null;
+        return this.tokens?.accessToken ?? null;
+      }
+
       this.logger.info('Access token near expiry, refreshing...');
-      const refreshed = await this.refreshAccessToken();
+      this.refreshPromise = this.refreshAccessToken().finally(() => {
+        this.refreshPromise = null;
+      });
+      const refreshed = await this.refreshPromise;
       if (!refreshed) return null;
     }
 

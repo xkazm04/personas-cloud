@@ -1,6 +1,16 @@
-import { createHmac } from 'node:crypto';
+import { createHmac, timingSafeEqual } from 'node:crypto';
 import { hashApiKey } from '@dac-cloud/shared';
 import type { IncomingMessage } from 'node:http';
+
+/**
+ * Constant-time string comparison to prevent timing side-channel attacks.
+ * Falls back to false when lengths differ (length is already leaked by most
+ * network protocols, so this is acceptable).
+ */
+function safeCompare(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  return timingSafeEqual(Buffer.from(a), Buffer.from(b));
+}
 
 // ---------------------------------------------------------------------------
 // RequestContext — identifies the caller for multi-tenant isolation
@@ -72,7 +82,7 @@ export function createAuth(teamApiKey: string, supabaseJwtSecret?: string) {
     if (!authHeader) return false;
     const parts = authHeader.split(' ');
     if (parts.length !== 2 || parts[0] !== 'Bearer') return false;
-    return hashApiKey(parts[1]!) === expectedHash;
+    return safeCompare(hashApiKey(parts[1]!), expectedHash);
   }
 
   return {
@@ -82,11 +92,11 @@ export function createAuth(teamApiKey: string, supabaseJwtSecret?: string) {
     },
 
     validateToken(token: string): boolean {
-      return hashApiKey(token) === expectedHash;
+      return safeCompare(hashApiKey(token), expectedHash);
     },
 
     validateWorkerToken(token: string, expectedWorkerToken: string): boolean {
-      return token === expectedWorkerToken;
+      return safeCompare(token, expectedWorkerToken);
     },
 
     /**

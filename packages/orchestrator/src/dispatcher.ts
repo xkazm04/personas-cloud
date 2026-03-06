@@ -12,11 +12,16 @@ interface QueuedExecution {
   receivedAt: number;
 }
 
+/** Maximum in-memory output bytes per execution (10 MB). */
+const MAX_OUTPUT_BYTES = 10 * 1024 * 1024;
+
 // In-memory tracking for active executions (real-time output streaming)
 interface ActiveExecution {
   workerId: string;
   startedAt: number;
   output: string[];
+  /** Running total of bytes buffered in `output` to enforce MAX_OUTPUT_BYTES. */
+  outputBytes: number;
   status: 'running' | 'completed' | 'failed' | 'cancelled';
   completedAt?: number;
   exitCode?: number;
@@ -53,7 +58,16 @@ export class Dispatcher {
     this.pool.on('stdout', (_workerId: string, msg: { executionId: string; chunk: string; timestamp: number }) => {
       const exec = this.active.get(msg.executionId);
       if (exec) {
-        exec.output.push(msg.chunk);
+        const chunkBytes = Buffer.byteLength(msg.chunk, 'utf8');
+        if (exec.outputBytes + chunkBytes <= MAX_OUTPUT_BYTES) {
+          exec.output.push(msg.chunk);
+          exec.outputBytes += chunkBytes;
+        } else if (exec.outputBytes < MAX_OUTPUT_BYTES) {
+          // Push a truncation marker once
+          exec.output.push('[OUTPUT TRUNCATED — 10 MB limit reached]');
+          exec.outputBytes = MAX_OUTPUT_BYTES;
+        }
+        // else: already truncated, silently discard
       }
 
       // Persist to DB
@@ -75,7 +89,15 @@ export class Dispatcher {
     this.pool.on('stderr', (_workerId: string, msg: { executionId: string; chunk: string; timestamp: number }) => {
       const exec = this.active.get(msg.executionId);
       if (exec) {
-        exec.output.push(`[STDERR] ${msg.chunk}`);
+        const stderrLine = `[STDERR] ${msg.chunk}`;
+        const chunkBytes = Buffer.byteLength(stderrLine, 'utf8');
+        if (exec.outputBytes + chunkBytes <= MAX_OUTPUT_BYTES) {
+          exec.output.push(stderrLine);
+          exec.outputBytes += chunkBytes;
+        } else if (exec.outputBytes < MAX_OUTPUT_BYTES) {
+          exec.output.push('[OUTPUT TRUNCATED — 10 MB limit reached]');
+          exec.outputBytes = MAX_OUTPUT_BYTES;
+        }
       }
 
       if (this.database) {
@@ -321,7 +343,7 @@ export class Dispatcher {
       env,
       config: {
         timeoutMs: request.config.timeoutMs || 300_000,
-        maxOutputBytes: 10 * 1024 * 1024, // 10MB
+        maxOutputBytes: MAX_OUTPUT_BYTES,
       },
     };
 
@@ -330,6 +352,7 @@ export class Dispatcher {
       workerId,
       startedAt: Date.now(),
       output: [],
+      outputBytes: 0,
       status: 'running',
     });
 
@@ -399,10 +422,12 @@ export class Dispatcher {
       const dbExec = db.getExecution(this.database, executionId);
       if (dbExec) {
         // Convert DB execution to ActiveExecution shape for backward compat
+        const output = dbExec.outputData ? dbExec.outputData.split('\n').filter(Boolean) : [];
         return {
           workerId: '',
           startedAt: dbExec.startedAt ? new Date(dbExec.startedAt).getTime() : 0,
-          output: dbExec.outputData ? dbExec.outputData.split('\n').filter(Boolean) : [],
+          output,
+          outputBytes: Buffer.byteLength(dbExec.outputData ?? '', 'utf8'),
           status: dbExec.status as ActiveExecution['status'],
           completedAt: dbExec.completedAt ? new Date(dbExec.completedAt).getTime() : undefined,
           durationMs: dbExec.durationMs ?? undefined,

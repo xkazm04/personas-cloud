@@ -66,6 +66,7 @@ export interface OrchestratorAck {
   type: 'ack';
   workerId: string;
   sessionToken: string;
+  protocolVersion: string;
 }
 
 export interface ExecAssign {
