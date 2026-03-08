@@ -19,6 +19,10 @@ export interface Persona {
   maxTurns: number | null;
   designContext: string | null;
   groupId: string | null;
+  /** JSON-encoded PermissionPolicy. When null, defaults to skip-all (legacy). */
+  permissionPolicy: string | null;
+  /** HMAC secret for webhook signature verification. Null means webhooks require API key auth. */
+  webhookSecret: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -55,6 +59,21 @@ export interface ModelProfile {
   authToken?: string;
 }
 
+/**
+ * Permission policy for constraining Claude CLI tool access per persona.
+ * When absent, the executor falls back to `--dangerously-skip-permissions`
+ * for backward compatibility. When present, only the listed tools are allowed
+ * via `--allowedTools`.
+ */
+export interface PermissionPolicy {
+  /** Explicit list of Claude CLI tool names to allow (e.g. "Bash", "Read", "Write", "Edit", "Glob", "Grep"). */
+  allowedTools?: string[];
+  /** If true, the Bash tool can make outbound network calls. Only relevant when Bash is in allowedTools. */
+  allowNetwork?: boolean;
+  /** If true, falls back to --dangerously-skip-permissions (legacy / admin override). */
+  skipAllPermissions?: boolean;
+}
+
 export interface PersonaCredential {
   id: string;
   projectId?: string;
@@ -63,6 +82,8 @@ export interface PersonaCredential {
   encryptedData: string;
   iv: string;
   tag: string;
+  salt?: string;     // hex — per-credential PBKDF2 salt (absent in legacy data)
+  iter?: number;     // PBKDF2 iteration count used to derive the key (absent in legacy data)
   metadata: string | null;
   lastUsedAt: string | null;
   createdAt: string;
@@ -81,6 +102,10 @@ export interface PersonaEvent {
   errorMessage: string | null;
   processedAt: string | null;
   useCaseId: string | null;
+  /** Number of retry attempts so far. 0 on first processing. */
+  retryCount: number;
+  /** ISO timestamp — when the next retry should be attempted. Null if not in retry state. */
+  nextRetryAt: string | null;
   createdAt: string;
 }
 
@@ -89,7 +114,13 @@ export interface PersonaEventSubscription {
   personaId: string;
   eventType: string;
   sourceFilter: string | null;
+  /** JSON-encoded payload filter conditions (EventBridge-style pattern). */
+  payloadFilter: string | null;
   enabled: boolean;
+  /** Maximum number of retry attempts before moving to dead_letter. Default 3. */
+  maxRetries: number;
+  /** Base delay in milliseconds for exponential backoff between retries. Default 5000. */
+  retryBackoffMs: number;
   useCaseId: string | null;
   createdAt: string;
   updatedAt: string;
@@ -103,9 +134,34 @@ export interface PersonaTrigger {
   enabled: boolean;
   lastTriggeredAt: string | null;
   nextTriggerAt: string | null;
+  /** Health status: 'healthy' (default), 'degraded' (e.g. broken cron expression). */
+  healthStatus: 'healthy' | 'degraded';
+  /** Human-readable reason for degraded health status. */
+  healthMessage: string | null;
   useCaseId: string | null;
   createdAt: string;
   updatedAt: string;
+}
+
+/**
+ * Audit log entry for each trigger firing, recording outcome metrics.
+ * Used by the trigger analytics system to correlate firing times with
+ * execution success/failure, cost, and duration.
+ */
+export interface TriggerFiring {
+  id: string;
+  triggerId: string;
+  personaId: string;
+  projectId: string;
+  eventId: string | null;
+  executionId: string | null;
+  /** Status of the firing: 'fired' (event published), 'dispatched' (execution started), 'completed', 'failed', 'skipped' */
+  status: string;
+  costUsd: number | null;
+  durationMs: number | null;
+  errorMessage: string | null;
+  firedAt: string;
+  resolvedAt: string | null;
 }
 
 export interface PersonaExecution {
@@ -129,6 +185,62 @@ export interface PersonaExecution {
   startedAt: string | null;
   completedAt: string | null;
   createdAt: string;
+}
+
+// ---------------------------------------------------------------------------
+// Execution progress — structured stage tracking for live executions
+// ---------------------------------------------------------------------------
+
+/** Semantic execution stages derived from Claude CLI stream-json output. */
+export type ExecutionStage =
+  | 'initializing'
+  | 'thinking'
+  | 'tool_calling'
+  | 'tool_result'
+  | 'generating'
+  | 'completed'
+  | 'failed';
+
+/** Structured progress snapshot for a running execution. */
+export interface ExecutionProgress {
+  /** Current semantic stage of the execution. */
+  stage: ExecutionStage;
+  /** Estimated progress percentage (0–100). Null if indeterminate. */
+  percentEstimate: number | null;
+  /** Current tool being invoked (only set during tool_calling stage). */
+  activeTool: string | null;
+  /** Human-readable description of what's happening. */
+  message: string;
+  /** Number of tool calls completed so far. */
+  toolCallsCompleted: number;
+  /** Timestamp when this stage was entered. */
+  stageStartedAt: number;
+}
+
+// ---------------------------------------------------------------------------
+// Human-in-the-loop review — pause/resume semantics for manual_review events
+// ---------------------------------------------------------------------------
+
+/** A review request emitted when a persona triggers a manual_review event. */
+export interface ReviewRequest {
+  /** Unique ID for this review request. */
+  reviewId: string;
+  /** The execution that is paused awaiting review. */
+  executionId: string;
+  /** Persona that triggered the review. */
+  personaId: string;
+  /** Project scope. */
+  projectId?: string;
+  /** The payload from the manual_review persona protocol event. */
+  payload: unknown;
+  /** Current status of the review. */
+  status: 'pending' | 'approved' | 'rejected' | 'timed_out';
+  /** When the review was requested. */
+  createdAt: number;
+  /** When the review was resolved (approved/rejected/timed_out). */
+  resolvedAt: number | null;
+  /** The human reviewer's decision message (injected back into CLI stdin). */
+  responseMessage: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -168,9 +280,16 @@ export interface WorkerInfo {
   status: 'connecting' | 'idle' | 'executing' | 'disconnected';
   version: string;
   capabilities: string[];
-  currentExecutionId?: string;
+  /** Active execution IDs on this worker (supports concurrent execution slots). */
+  currentExecutionIds: string[];
+  /** Maximum concurrent execution slots for this worker. */
+  maxConcurrentSlots: number;
+  /** Number of available slots (maxConcurrentSlots - currentExecutionIds.length). */
+  availableSlots: number;
   connectedAt: number;
   lastHeartbeat: number;
+  /** Latest system health metrics reported by this worker. Null until first heartbeat with metrics. */
+  healthMetrics?: import('./protocol.js').WorkerHealthMetrics | null;
 }
 
 // Execution output chunk — produced to Kafka for Vibeman SSE consumption
@@ -189,7 +308,7 @@ export interface PersonaCloudEvent {
   timestamp: number;
 }
 
-// Kafka topic names
+// Kafka topic names (base topics — use projectTopic() for per-project isolation)
 export const TOPICS = {
   EXEC_REQUESTS: 'persona.exec.v1',
   EXEC_OUTPUT: 'persona.output.v1',
@@ -197,6 +316,140 @@ export const TOPICS = {
   EVENTS: 'persona.events.v1',
   DLQ: 'persona.dlq.v1',
 } as const;
+
+/**
+ * Returns a project-scoped Kafka topic name.
+ * Format: `{baseTopic}.{projectId}` — e.g. `persona.exec.v1.proj_abc123`
+ * If projectId is undefined or 'default', returns the base topic unchanged.
+ */
+export function projectTopic(baseTopic: string, projectId?: string): string {
+  if (!projectId || projectId === 'default') return baseTopic;
+  return `${baseTopic}.${projectId}`;
+}
+
+/**
+ * Extracts the project ID from a scoped topic name, or undefined if it's a base topic.
+ */
+export function extractProjectId(topic: string, baseTopic: string): string | undefined {
+  if (!topic.startsWith(baseTopic + '.')) return undefined;
+  const suffix = topic.slice(baseTopic.length + 1);
+  return suffix || undefined;
+}
+
+// ---------------------------------------------------------------------------
+// Compilation API — programmatic persona creation via the design pipeline
+// ---------------------------------------------------------------------------
+
+export type CompilationStage =
+  | 'prompt_assembly'
+  | 'llm_generation'
+  | 'result_parsing'
+  | 'feasibility_check'
+  | 'persist';
+
+export interface CompileRequest {
+  /** High-level intent describing what the persona should do. */
+  intent: string;
+  /** Optional tool names to include in the compiled persona. */
+  tools?: string[];
+  /** Optional connector/service definitions the persona should use. */
+  connectors?: Array<{ name: string; description?: string }>;
+  /** Optional model profile override for the compilation LLM call. */
+  modelProfile?: string;
+  /** Optional max budget for the compilation execution (default: $1.00). */
+  maxBudgetUsd?: number;
+}
+
+export interface BatchCompileRequest {
+  /** High-level description of the team/group of personas to create. */
+  description: string;
+  /** Number of personas to create (1-10). */
+  count?: number;
+  /** Optional tool names available to all compiled personas. */
+  tools?: string[];
+  /** Optional connector definitions available to all personas. */
+  connectors?: Array<{ name: string; description?: string }>;
+  /** Optional model profile override. */
+  modelProfile?: string;
+}
+
+export interface CompileResult {
+  /** Unique compilation job ID (same as executionId). */
+  compileId: string;
+  /** Status of the compilation. */
+  status: 'queued' | 'running' | 'completed' | 'failed';
+  /** Current compilation stage (null if queued). */
+  stage: CompilationStage | null;
+  /** The compiled persona (null until completed). */
+  persona: Persona | null;
+  /** Error message if failed. */
+  error: string | null;
+}
+
+/** Per-item result within a batch compilation. */
+export interface BatchCompileItemResult {
+  /** Zero-based index within the batch. */
+  index: number;
+  /** Status of this individual item. */
+  status: 'completed' | 'failed';
+  /** The compiled persona (null if failed). */
+  persona: Persona | null;
+  /** Error message if this item failed. */
+  error: string | null;
+}
+
+export interface BatchCompileResult {
+  /** Unique batch compilation ID. */
+  batchId: string;
+  /** Individual compilation jobs. */
+  compileIds: string[];
+  /**
+   * Overall status:
+   * - `queued`: execution not yet started
+   * - `running`: LLM generation in progress
+   * - `completed`: all items parsed successfully
+   * - `partial`: some items succeeded, some failed (HTTP 200 — check `results` for per-item status)
+   * - `failed`: execution failed or no items could be parsed
+   */
+  status: 'queued' | 'running' | 'completed' | 'partial' | 'failed';
+  /** Per-item results. Present when status is 'completed', 'partial', or 'failed' (post-execution). */
+  results?: BatchCompileItemResult[];
+  /** Top-level error message when the entire batch fails. */
+  error?: string | null;
+}
+
+// ---------------------------------------------------------------------------
+// Cloud Deployments — one-click local→cloud API deployment
+// ---------------------------------------------------------------------------
+
+export type DeploymentStatus = 'active' | 'paused' | 'failed';
+
+export interface CloudDeployment {
+  id: string;
+  projectId: string;
+  personaId: string;
+  /** Slug-based route path: /api/deployed/{slug} */
+  slug: string;
+  /** Human-readable label (defaults to persona name) */
+  label: string;
+  status: DeploymentStatus;
+  /** Whether the webhook endpoint is enabled */
+  webhookEnabled: boolean;
+  /** HMAC secret for verifying incoming webhook requests */
+  webhookSecret: string | null;
+  /** Total invocation count since deployment */
+  invocationCount: number;
+  /** Last invocation timestamp */
+  lastInvokedAt: string | null;
+  /** Monthly budget cap in USD — null means unlimited */
+  maxMonthlyBudgetUsd: number | null;
+  /** Accumulated cost for the current budget month */
+  currentMonthCostUsd: number;
+  /** Budget tracking month (YYYY-MM format) */
+  budgetMonth: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
 
 // Protocol version — bump major on breaking changes, minor on additive changes
 export const PROTOCOL_VERSION = '1.0.0';

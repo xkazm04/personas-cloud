@@ -1,15 +1,31 @@
 import { spawn, execSync, type ChildProcess } from 'node:child_process';
+import { nanoid } from 'nanoid';
 import type { ExecAssign } from '@dac-cloud/shared';
-import { LineBuffer, parseStreamLine, detectPersonaEvents } from './parser.js';
-import { createTempDir, cleanupTempDir, ensureClaudeConfig, writeClaudeCredentials, clearClaudeCredentials } from './cleanup.js';
+import { buildPermissionArgs } from '@dac-cloud/shared';
+import { StreamProcessor } from './parser.js';
+import type { StreamEvent } from './parser.js';
+import type { ExecutionProgress } from '@dac-cloud/shared';
+import { createTempDir, cleanupTempDir, createIsolatedHome } from './cleanup.js';
+import { sanitizeEnvVars } from './validation.js';
 import type { Logger } from 'pino';
+
+/** Minimum interval between progress updates sent to the orchestrator (ms). */
+const PROGRESS_THROTTLE_MS = 500;
+
+export interface ResolvedClaudeCommand {
+  command: string;
+  shell: boolean;
+}
 
 /**
  * Resolve the Claude CLI command.
  * On Windows, the CLI may be installed as claude.exe (WinGet), claude.cmd (npm), or claude (PATH).
  * We try `where`/`which` to find the actual binary path for reliable spawning.
+ *
+ * The result is deterministic for the lifetime of the worker process, so it
+ * should be called once at startup and the result cached.
  */
-function resolveClaudeCommand(): { command: string; shell: boolean } {
+export function resolveClaudeCommand(): ResolvedClaudeCommand {
   const isWindows = process.platform === 'win32';
 
   if (isWindows) {
@@ -28,33 +44,44 @@ function resolveClaudeCommand(): { command: string; shell: boolean } {
   return { command: 'claude', shell: false };
 }
 
+/**
+ * Discriminated union of all messages the Executor can emit during execution.
+ * Consumers receive a single `onMessage` callback and switch on `msg.type`.
+ */
+export type ExecutorMessage =
+  | { type: 'stdout'; chunk: string; timestamp: number }
+  | { type: 'stderr'; chunk: string; timestamp: number }
+  | { type: 'event'; eventType: string; payload: unknown }
+  | { type: 'progress'; progress: ExecutionProgress }
+  | { type: 'review_request'; reviewId: string; payload: unknown }
+  /** Synchronization point to flush micro-batching buffers before completion. */
+  | { type: 'flush_output' }
+  | { type: 'complete'; status: 'completed' | 'failed' | 'cancelled'; exitCode: number; durationMs: number; sessionId?: string; totalCostUsd?: number };
+
 export interface ExecutorCallbacks {
-  onStdout(chunk: string, timestamp: number): void;
-  onStderr(chunk: string, timestamp: number): void;
-  onEvent(eventType: string, payload: unknown): void;
-  onComplete(status: 'completed' | 'failed' | 'cancelled', exitCode: number, durationMs: number, sessionId?: string, totalCostUsd?: number): void;
+  onMessage(msg: ExecutorMessage): void;
 }
 
 export class Executor {
   private childProcess: ChildProcess | null = null;
   private killed = false;
+  /** Set to true once the child process emits a 'close' event. */
+  private exited = false;
+  /** Active review ID when paused for human review. */
+  private pendingReviewId: string | null = null;
+  /** Resolver for the pending review promise. */
+  private reviewResolver: ((message: string) => void) | null = null;
 
-  constructor(private logger: Logger) {}
+  constructor(
+    private logger: Logger,
+    private claudeCommand: ResolvedClaudeCommand,
+  ) {}
 
   async execute(assignment: ExecAssign, callbacks: ExecutorCallbacks): Promise<void> {
     const startTime = Date.now();
     const execDir = createTempDir(assignment.executionId);
     let sessionId: string | undefined;
     let totalCostUsd: number | undefined;
-
-    // Ensure Claude config exists
-    ensureClaudeConfig(this.logger);
-
-    // Write OAuth token to Claude CLI credentials file
-    const oauthToken = assignment.env['ANTHROPIC_API_KEY'];
-    if (oauthToken && oauthToken.startsWith('sk-ant-oat')) {
-      writeClaudeCredentials(oauthToken, this.logger);
-    }
 
     this.logger.info({
       executionId: assignment.executionId,
@@ -64,30 +91,44 @@ export class Executor {
     }, 'Starting execution');
 
     try {
-      const { command, shell } = resolveClaudeCommand();
+      const { command, shell } = this.claudeCommand;
+      const permissionArgs = buildPermissionArgs(assignment.permissionPolicy);
       const args = [
         '-p', '-',
         '--output-format', 'stream-json',
         '--verbose',
-        '--dangerously-skip-permissions',
+        ...permissionArgs,
       ];
 
-      this.logger.info({ command, shell }, 'Resolved Claude CLI');
+      this.logger.info({ command, shell, permissionArgs }, 'Resolved Claude CLI');
 
       // Build child process environment — inherit current env, then inject
-      // credential vars directly into childEnv (never into process.env) to
-      // prevent cross-execution credential leakage.
+      // only validated credential vars into childEnv (never into process.env)
+      // to prevent cross-execution credential leakage and RCE via env hijack.
       const childEnv = { ...process.env };
-      for (const [key, value] of Object.entries(assignment.env)) {
-        if (key === 'ANTHROPIC_API_KEY' && value.startsWith('sk-ant-oat')) {
-          continue; // Written to credentials file instead
-        }
+
+      // Sanitize user-supplied env vars: reject dangerous names like
+      // NODE_OPTIONS, LD_PRELOAD, PATH, HOME, etc.
+      const { safe: safeEnv, rejected } = sanitizeEnvVars(assignment.env);
+      if (rejected.length > 0) {
+        this.logger.warn({
+          executionId: assignment.executionId,
+          rejectedEnvVars: rejected,
+        }, 'Blocked dangerous environment variable names from assignment');
+      }
+      for (const [key, value] of Object.entries(safeEnv)) {
         childEnv[key] = value;
       }
+
       // Unset CLAUDECODE to avoid "nested session" guard when running inside another Claude Code session
       delete childEnv['CLAUDECODE'];
-      // Remove ANTHROPIC_API_KEY so CLI uses credentials file (OAuth) instead of API key auth
-      delete childEnv['ANTHROPIC_API_KEY'];
+
+      // Create a per-execution isolated home directory so the Claude CLI
+      // reads/writes its own config and credential files. This prevents
+      // credential file races between concurrent executions on the same host.
+      const isolatedHome = createIsolatedHome(execDir, this.logger);
+      childEnv['HOME'] = isolatedHome;
+      childEnv['USERPROFILE'] = isolatedHome;
 
       this.childProcess = spawn(command, args, {
         cwd: execDir,
@@ -109,38 +150,89 @@ export class Executor {
         this.kill();
       }, assignment.config.timeoutMs);
 
-      // Parse stdout
-      const stdoutBuffer = new LineBuffer();
-      this.childProcess.stdout!.on('data', (data: Buffer) => {
-        const lines = stdoutBuffer.push(data.toString());
-        for (const line of lines) {
-          callbacks.onStdout(line, Date.now());
+      // Stream parsing pipeline — all line-buffering, JSON parsing, event
+      // detection, and progress tracking are encapsulated in StreamProcessor.
+      const stream = new StreamProcessor(this.logger);
 
-          // Parse structured data
-          const parsed = parseStreamLine(line);
-          if (parsed.sessionId) sessionId = parsed.sessionId;
-          if (parsed.totalCostUsd) totalCostUsd = parsed.totalCostUsd;
+      // Throttle progress updates: buffer the latest snapshot and send at most once per PROGRESS_THROTTLE_MS.
+      let pendingProgress: ExecutionProgress | null = null;
+      let lastProgressSentAt = 0;
+      let progressTimer: ReturnType<typeof setTimeout> | null = null;
 
-          // Detect persona protocol events
-          const events = detectPersonaEvents(line, this.logger);
-          for (const event of events) {
-            callbacks.onEvent(event.eventType, event.payload);
+      const emit = (msg: ExecutorMessage) => callbacks.onMessage(msg);
+
+      const sendThrottledProgress = (progress: ExecutionProgress) => {
+        const now = Date.now();
+        const elapsed = now - lastProgressSentAt;
+
+        if (elapsed >= PROGRESS_THROTTLE_MS) {
+          lastProgressSentAt = now;
+          pendingProgress = null;
+          if (progressTimer) {
+            clearTimeout(progressTimer);
+            progressTimer = null;
+          }
+          emit({ type: 'progress', progress });
+        } else {
+          pendingProgress = progress;
+          if (!progressTimer) {
+            progressTimer = setTimeout(() => {
+              progressTimer = null;
+              if (pendingProgress) {
+                lastProgressSentAt = Date.now();
+                emit({ type: 'progress', progress: pendingProgress });
+                pendingProgress = null;
+              }
+            }, PROGRESS_THROTTLE_MS - elapsed);
           }
         }
+      };
+
+      const dispatchStreamEvents = (events: StreamEvent[]) => {
+        for (const evt of events) {
+          switch (evt.type) {
+            case 'stdout':
+              emit({ type: 'stdout', chunk: evt.line, timestamp: evt.timestamp });
+              break;
+            case 'stderr':
+              emit({ type: 'stderr', chunk: evt.line, timestamp: evt.timestamp });
+              break;
+            case 'session_id':
+              sessionId = evt.sessionId;
+              break;
+            case 'cost':
+              totalCostUsd = evt.totalCostUsd;
+              break;
+            case 'progress':
+              sendThrottledProgress(evt.progress);
+              break;
+            case 'persona_event':
+              emit({ type: 'event', eventType: evt.eventType, payload: evt.payload });
+              // Pause execution for manual_review events
+              if (evt.eventType === 'manual_review' && this.childProcess) {
+                const reviewId = nanoid();
+                this.pendingReviewId = reviewId;
+                this.logger.info({ executionId: assignment.executionId, reviewId }, 'Pausing execution for manual review');
+                this.childProcess.stdout!.pause();
+                emit({ type: 'review_request', reviewId, payload: evt.payload });
+              }
+              break;
+          }
+        }
+      };
+
+      this.childProcess.stdout!.on('data', (data: Buffer) => {
+        dispatchStreamEvents(stream.pushStdout(data.toString()));
       });
 
-      // Parse stderr
-      const stderrBuffer = new LineBuffer();
       this.childProcess.stderr!.on('data', (data: Buffer) => {
-        const lines = stderrBuffer.push(data.toString());
-        for (const line of lines) {
-          callbacks.onStderr(line, Date.now());
-        }
+        dispatchStreamEvents(stream.pushStderr(data.toString()));
       });
 
       // Wait for process to exit
       const exitCode = await new Promise<number>((resolve) => {
         this.childProcess!.on('close', (code: number | null) => {
+          this.exited = true;
           clearTimeout(timeoutHandle);
           resolve(code ?? 1);
         });
@@ -152,16 +244,31 @@ export class Executor {
         });
       });
 
-      // Flush remaining buffered data
-      for (const line of stdoutBuffer.flush()) {
-        callbacks.onStdout(line, Date.now());
+      // Flush remaining buffered data through the stream pipeline
+      dispatchStreamEvents(stream.flush());
+
+      // Flush any pending throttled progress update before completion
+      if (progressTimer) {
+        clearTimeout(progressTimer);
+        progressTimer = null;
       }
-      for (const line of stderrBuffer.flush()) {
-        callbacks.onStderr(line, Date.now());
+      if (pendingProgress) {
+        emit({ type: 'progress', progress: pendingProgress });
+        pendingProgress = null;
       }
 
+      // Synchronize: flush any micro-batched output before sending completion.
+      // This ensures the orchestrator receives all output before the status change,
+      // preventing output arriving after the completion message due to timer interleave.
+      emit({ type: 'flush_output' });
+
       const durationMs = Date.now() - startTime;
-      const status = this.killed ? 'cancelled' : (exitCode === 0 ? 'completed' : 'failed');
+      // Guard timeout-kill vs natural-completion race: if the timeout fires and
+      // sets killed=true but the process exits with code 0 in the same tick,
+      // the exit code takes precedence — the execution completed successfully
+      // before the SIGTERM was delivered.
+      const status: 'completed' | 'failed' | 'cancelled' =
+        exitCode === 0 ? 'completed' : this.killed ? 'cancelled' : 'failed';
 
       this.logger.info({
         executionId: assignment.executionId,
@@ -172,19 +279,19 @@ export class Executor {
         totalCostUsd,
       }, 'Execution finished');
 
-      callbacks.onComplete(status, exitCode, durationMs, sessionId, totalCostUsd);
+      emit({ type: 'complete', status, exitCode, durationMs, sessionId, totalCostUsd });
 
     } finally {
-      // Cleanup: remove temp directory and clear persisted OAuth token
+      // Cleanup: remove temp directory
       cleanupTempDir(execDir, this.logger);
-      clearClaudeCredentials(this.logger);
       this.childProcess = null;
       this.killed = false;
+      this.exited = false;
     }
   }
 
   kill(): void {
-    if (this.childProcess && !this.killed) {
+    if (this.childProcess && !this.killed && !this.exited) {
       this.killed = true;
       this.childProcess.kill('SIGTERM');
 
@@ -195,5 +302,36 @@ export class Executor {
         }
       }, 5_000);
     }
+
+    // Also resolve any pending review so the process can exit cleanly
+    if (this.reviewResolver) {
+      this.reviewResolver('');
+      this.reviewResolver = null;
+      this.pendingReviewId = null;
+    }
+  }
+
+  /**
+   * Resume a paused execution after human review.
+   * Resumes the stdout stream so the child process can continue.
+   */
+  resolveReview(reviewId: string, message: string): boolean {
+    if (this.pendingReviewId !== reviewId) return false;
+
+    this.logger.info({ reviewId, message }, 'Resolving review — resuming execution');
+    this.pendingReviewId = null;
+
+    // Resume stdout stream — removes backpressure, allowing the child process to continue
+    if (this.childProcess) {
+      this.childProcess.stdout!.resume();
+    }
+
+    // Resolve the pending promise if one exists
+    if (this.reviewResolver) {
+      this.reviewResolver(message);
+      this.reviewResolver = null;
+    }
+
+    return true;
   }
 }

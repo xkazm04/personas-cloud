@@ -22,8 +22,10 @@ export interface OAuthState {
   expiresAt: number;    // unix ms, 10 minute window
 }
 
+const MAX_PENDING_STATES = 50;
+
 export class OAuthManager {
-  private pendingState: OAuthState | null = null;
+  private pendingStates = new Map<string, OAuthState>();
   private tokens: OAuthTokens | null = null;
   /** In-flight refresh promise shared by concurrent callers. */
   private refreshPromise: Promise<OAuthTokens | null> | null = null;
@@ -41,12 +43,25 @@ export class OAuthManager {
       .update(codeVerifier)
       .digest('base64url');
 
-    this.pendingState = {
+    // Prune expired entries to prevent unbounded growth
+    const now = Date.now();
+    for (const [key, entry] of this.pendingStates) {
+      if (now > entry.expiresAt) this.pendingStates.delete(key);
+    }
+
+    // Cap total pending states to prevent memory DoS via rapid authorize calls
+    if (this.pendingStates.size >= MAX_PENDING_STATES) {
+      // Evict the oldest entry to make room
+      const oldest = this.pendingStates.keys().next().value!;
+      this.pendingStates.delete(oldest);
+    }
+
+    this.pendingStates.set(state, {
       state,
       codeVerifier,
-      createdAt: Date.now(),
-      expiresAt: Date.now() + 10 * 60 * 1000, // 10 minutes
-    };
+      createdAt: now,
+      expiresAt: now + 10 * 60 * 1000, // 10 minutes
+    });
 
     const params = new URLSearchParams({
       code: 'true',
@@ -71,21 +86,20 @@ export class OAuthManager {
    */
   async exchangeCode(authorizationCode: string, state: string): Promise<OAuthTokens | null> {
     // Validate state
-    if (!this.pendingState) {
-      this.logger.error('No pending OAuth state — call generateAuthUrl first');
+    const pending = this.pendingStates.get(state);
+    if (!pending) {
+      this.logger.error('No pending OAuth state for this state parameter — call generateAuthUrl first');
       return null;
     }
 
-    if (this.pendingState.state !== state) {
-      this.logger.error('OAuth state mismatch');
-      return null;
-    }
-
-    if (Date.now() > this.pendingState.expiresAt) {
+    if (Date.now() > pending.expiresAt) {
       this.logger.error('OAuth state expired');
-      this.pendingState = null;
+      this.pendingStates.delete(state);
       return null;
     }
+
+    // Consume the state so it cannot be replayed
+    this.pendingStates.delete(state);
 
     const cleanedCode = authorizationCode.split('#')[0]?.split('&')[0] ?? authorizationCode;
 
@@ -94,8 +108,8 @@ export class OAuthManager {
       client_id: CLIENT_ID,
       code: cleanedCode,
       redirect_uri: REDIRECT_URI,
-      code_verifier: this.pendingState.codeVerifier,
-      state: this.pendingState.state,
+      code_verifier: pending.codeVerifier,
+      state: pending.state,
     };
 
     try {
@@ -127,8 +141,6 @@ export class OAuthManager {
         expiresAt: Date.now() + data.expires_in * 1000,
         scopes: data.scope ? data.scope.split(' ') : ['user:inference', 'user:profile'],
       };
-
-      this.pendingState = null;
 
       this.logger.info({
         scopes: this.tokens.scopes,
@@ -204,8 +216,14 @@ export class OAuthManager {
 
   /**
    * Get a valid access token, refreshing if necessary.
+   *
    * Uses a pending-promise mutex so concurrent callers share a single
-   * in-flight refresh instead of racing against each other.
+   * in-flight refresh instead of racing against each other.  This is
+   * critical because OAuth refresh tokens are single-use rotation tokens:
+   * if two callers both call refreshAccessToken() concurrently, the second
+   * one sends an already-invalidated refresh token, causing a 401 and
+   * permanently breaking the token chain.
+   *
    * Returns null if no tokens available or refresh fails.
    */
   async getValidAccessToken(): Promise<string | null> {
@@ -214,20 +232,20 @@ export class OAuthManager {
     // Refresh if within 10 minutes of expiry
     const TEN_MINUTES = 10 * 60 * 1000;
     if (Date.now() > this.tokens.expiresAt - TEN_MINUTES) {
-      // If a refresh is already in-flight, wait for it instead of starting another
-      if (this.refreshPromise) {
+      // If a refresh is already in-flight, wait for it instead of starting another.
+      // Both the first caller (who starts the refresh) and subsequent callers
+      // go through the same await path to avoid TOCTOU gaps.
+      if (!this.refreshPromise) {
+        this.logger.info('Access token near expiry, refreshing...');
+        this.refreshPromise = this.refreshAccessToken().finally(() => {
+          this.refreshPromise = null;
+        });
+      } else {
         this.logger.info('Token refresh already in-flight, waiting...');
-        const result = await this.refreshPromise;
-        if (!result) return null;
-        return this.tokens?.accessToken ?? null;
       }
 
-      this.logger.info('Access token near expiry, refreshing...');
-      this.refreshPromise = this.refreshAccessToken().finally(() => {
-        this.refreshPromise = null;
-      });
-      const refreshed = await this.refreshPromise;
-      if (!refreshed) return null;
+      const result = await this.refreshPromise;
+      if (!result) return null;
     }
 
     return this.tokens.accessToken;
@@ -257,7 +275,7 @@ export class OAuthManager {
 
   clearTokens(): void {
     this.tokens = null;
-    this.pendingState = null;
+    this.pendingStates.clear();
     this.logger.info('OAuth tokens cleared');
   }
 }

@@ -1,5 +1,5 @@
 import { createHmac, timingSafeEqual } from 'node:crypto';
-import { hashApiKey } from '@dac-cloud/shared';
+import { hashApiKey, verifyApiKey } from '@dac-cloud/shared';
 import type { IncomingMessage } from 'node:http';
 
 /**
@@ -7,7 +7,7 @@ import type { IncomingMessage } from 'node:http';
  * Falls back to false when lengths differ (length is already leaked by most
  * network protocols, so this is acceptable).
  */
-function safeCompare(a: string, b: string): boolean {
+export function safeCompare(a: string, b: string): boolean {
   if (a.length !== b.length) return false;
   return timingSafeEqual(Buffer.from(a), Buffer.from(b));
 }
@@ -37,10 +37,23 @@ interface JwtPayload {
   sub: string;
   email?: string;
   exp?: number;
+  iss?: string;
+  aud?: string;
   [key: string]: unknown;
 }
 
-function verifySupabaseJwt(token: string, secret: string): JwtPayload | null {
+interface JwtVerifyOptions {
+  /** Expected issuer (iss) claim. Skipped if undefined. */
+  expectedIssuer?: string;
+  /** Expected audience (aud) claim. Skipped if undefined. */
+  expectedAudience?: string;
+}
+
+function verifySupabaseJwt(
+  token: string,
+  secret: string,
+  options: JwtVerifyOptions = {},
+): JwtPayload | null {
   const parts = token.split('.');
   if (parts.length !== 3) return null;
 
@@ -67,6 +80,12 @@ function verifySupabaseJwt(token: string, secret: string): JwtPayload | null {
 
   if (!payload.sub) return null;
 
+  // Validate issuer claim
+  if (options.expectedIssuer && payload.iss !== options.expectedIssuer) return null;
+
+  // Validate audience claim
+  if (options.expectedAudience && payload.aud !== options.expectedAudience) return null;
+
   return payload;
 }
 
@@ -74,7 +93,23 @@ function verifySupabaseJwt(token: string, secret: string): JwtPayload | null {
 // Auth factory
 // ---------------------------------------------------------------------------
 
-export function createAuth(teamApiKey: string, supabaseJwtSecret?: string) {
+export interface AuthOptions {
+  supabaseJwtSecret?: string;
+  /** Supabase project ref, used to derive the expected JWT issuer. */
+  supabaseProjectRef?: string;
+  /** When true, requests without a JWT fall back to admin context. Defaults to false. */
+  enableAdminFallback?: boolean;
+}
+
+export function createAuth(teamApiKey: string, options: AuthOptions = {}) {
+  const { supabaseJwtSecret, supabaseProjectRef, enableAdminFallback = false } = options;
+  const jwtVerifyOptions: JwtVerifyOptions = {
+    expectedAudience: supabaseJwtSecret ? 'authenticated' : undefined,
+    expectedIssuer: supabaseProjectRef
+      ? `https://${supabaseProjectRef}.supabase.co/auth/v1`
+      : undefined,
+  };
+  // Pre-compute salted hash once at startup for efficient verification
   const expectedHash = hashApiKey(teamApiKey);
 
   function validateApiKey(req: IncomingMessage): boolean {
@@ -82,7 +117,7 @@ export function createAuth(teamApiKey: string, supabaseJwtSecret?: string) {
     if (!authHeader) return false;
     const parts = authHeader.split(' ');
     if (parts.length !== 2 || parts[0] !== 'Bearer') return false;
-    return safeCompare(hashApiKey(parts[1]!), expectedHash);
+    return verifyApiKey(parts[1]!, expectedHash);
   }
 
   return {
@@ -92,7 +127,7 @@ export function createAuth(teamApiKey: string, supabaseJwtSecret?: string) {
     },
 
     validateToken(token: string): boolean {
-      return safeCompare(hashApiKey(token), expectedHash);
+      return verifyApiKey(token, expectedHash);
     },
 
     validateWorkerToken(token: string, expectedWorkerToken: string): boolean {
@@ -100,11 +135,12 @@ export function createAuth(teamApiKey: string, supabaseJwtSecret?: string) {
     },
 
     /**
-     * Dual auth: validates API key + optional Supabase JWT.
+     * Dual auth: validates API key + Supabase JWT.
      * Returns a RequestContext describing the caller.
      *
      * - JWT present + valid → user context (projectId = Supabase UUID)
-     * - No JWT or JWT disabled → admin context (projectId = '__admin__')
+     * - No JWT + enableAdminFallback → admin context (projectId = '__admin__')
+     * - No JWT + !enableAdminFallback → null (reject)
      * - Invalid API key → null (reject)
      */
     validateAndExtractContext(req: IncomingMessage): RequestContext | null {
@@ -114,7 +150,7 @@ export function createAuth(teamApiKey: string, supabaseJwtSecret?: string) {
       // Check for user JWT
       const userToken = req.headers['x-user-token'] as string | undefined;
       if (userToken && supabaseJwtSecret) {
-        const jwt = verifySupabaseJwt(userToken, supabaseJwtSecret);
+        const jwt = verifySupabaseJwt(userToken, supabaseJwtSecret, jwtVerifyOptions);
         if (jwt) {
           return {
             authType: 'user',
@@ -126,8 +162,14 @@ export function createAuth(teamApiKey: string, supabaseJwtSecret?: string) {
         return null;
       }
 
-      // No JWT or JWT auth disabled → admin context
-      return { authType: 'admin', projectId: '__admin__' };
+      // No JWT provided (or JWT auth not configured)
+      // Only grant admin context if explicitly enabled
+      if (enableAdminFallback) {
+        return { authType: 'admin', projectId: '__admin__' };
+      }
+
+      // Admin fallback disabled — reject requests without a valid JWT
+      return null;
     },
   };
 }
