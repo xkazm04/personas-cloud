@@ -1,100 +1,81 @@
 import type { Logger } from 'pino';
-
-export interface ParsedLine {
-  raw: string;
-  type?: string;
-  sessionId?: string;
-  durationMs?: number;
-  totalCostUsd?: number;
-  isResult?: boolean;
-}
+import type { ProgressInfo, ProtocolEventType } from '@dac-cloud/shared';
+import { PROTOCOL_EVENT_KEYS } from '@dac-cloud/shared';
 
 export interface PersonaProtocolEvent {
-  eventType: 'manual_review' | 'user_message' | 'persona_action' | 'emit_event';
+  eventType: ProtocolEventType;
   payload: unknown;
 }
 
-// Parse a single line of Claude CLI stream-json output
-export function parseStreamLine(line: string): ParsedLine {
-  const result: ParsedLine = { raw: line };
+export interface StreamEvents {
+  raw: string;
+  type?: string;
+  sessionId?: string;
+  totalCostUsd?: number;
+  personaEvents: PersonaProtocolEvent[];
+  progress: ProgressInfo | null;
+}
 
+const JSON_BLOCK_PATTERN = /\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}/g;
+
+// Extract all structured artifacts from a single stream line in one JSON parse pass
+export function extractStreamEvents(line: string, logger: Logger): StreamEvents {
+  const result: StreamEvents = { raw: line, personaEvents: [], progress: null };
+
+  let parsed: Record<string, unknown>;
   try {
-    const parsed = JSON.parse(line);
-    result.type = parsed.type;
-
-    // Extract session ID from various locations
-    if (parsed.session_id) {
-      result.sessionId = parsed.session_id;
-    }
-    if (parsed.result?.session_id) {
-      result.sessionId = parsed.result.session_id;
-    }
-
-    // Extract completion data
-    if (parsed.type === 'result') {
-      result.isResult = true;
-      result.durationMs = parsed.duration_ms || parsed.result?.duration_ms;
-      result.totalCostUsd = parsed.total_cost_usd || parsed.result?.total_cost_usd;
-    }
+    parsed = JSON.parse(line);
   } catch {
-    // Not valid JSON — raw text line, that's fine
+    return result; // raw text line — nothing to extract
+  }
+
+  result.type = parsed.type as string | undefined;
+
+  // Session ID and completion data (from top-level result messages)
+  if (parsed.session_id) result.sessionId = parsed.session_id as string;
+  const resultObj = parsed.result as Record<string, unknown> | undefined;
+  if (resultObj?.session_id) result.sessionId = resultObj.session_id as string;
+  if (parsed.type === 'result') {
+    result.totalCostUsd = (parsed.total_cost_usd ?? resultObj?.total_cost_usd) as number | undefined;
+  }
+
+  // Persona protocol events and progress events (from assistant message content blocks)
+  const message = parsed.message as Record<string, unknown> | undefined;
+  if (parsed.type === 'assistant' && Array.isArray(message?.content)) {
+    for (const block of message!.content as Array<Record<string, unknown>>) {
+      if (block.type !== 'text' || typeof block.text !== 'string') continue;
+
+      const matches = block.text.match(JSON_BLOCK_PATTERN);
+      if (!matches) continue;
+
+      for (const match of matches) {
+        let obj: Record<string, unknown>;
+        try { obj = JSON.parse(match); } catch { continue; }
+
+        for (const key of PROTOCOL_EVENT_KEYS) {
+          if (obj[key]) {
+            result.personaEvents.push({ eventType: key as ProtocolEventType, payload: obj[key] });
+            logger.info({ eventType: key }, 'Detected persona protocol event');
+          }
+        }
+
+        if (!result.progress) {
+          const prog = obj.progress as Record<string, unknown> | undefined;
+          if (prog && typeof prog.phase === 'string' && typeof prog.percent === 'number') {
+            logger.debug({ phase: prog.phase, percent: prog.percent }, 'Detected progress event');
+            result.progress = {
+              phase: prog.phase,
+              percent: Math.max(0, Math.min(100, prog.percent)),
+              detail: prog.detail as string | undefined,
+              updatedAt: Date.now(),
+            };
+          }
+        }
+      }
+    }
   }
 
   return result;
-}
-
-// Detect persona protocol events embedded in assistant text
-export function detectPersonaEvents(line: string, logger: Logger): PersonaProtocolEvent[] {
-  const events: PersonaProtocolEvent[] = [];
-
-  try {
-    const parsed = JSON.parse(line);
-
-    // Check for persona events in assistant message content blocks
-    if (parsed.type === 'assistant' && parsed.message?.content) {
-      for (const block of parsed.message.content) {
-        if (block.type === 'text' && block.text) {
-          const extracted = extractJsonBlocks(block.text, logger);
-          events.push(...extracted);
-        }
-      }
-    }
-  } catch {
-    // Not JSON or not assistant message
-  }
-
-  return events;
-}
-
-function extractJsonBlocks(text: string, logger: Logger): PersonaProtocolEvent[] {
-  const events: PersonaProtocolEvent[] = [];
-  const protocolKeys = ['manual_review', 'user_message', 'persona_action', 'emit_event'] as const;
-
-  // Find JSON-like blocks in text
-  const jsonPattern = /\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}/g;
-  const matches = text.match(jsonPattern);
-
-  if (!matches) return events;
-
-  for (const match of matches) {
-    try {
-      const obj = JSON.parse(match);
-
-      for (const key of protocolKeys) {
-        if (obj[key]) {
-          events.push({
-            eventType: key,
-            payload: obj[key],
-          });
-          logger.info({ eventType: key }, 'Detected persona protocol event');
-        }
-      }
-    } catch {
-      // Not valid JSON block
-    }
-  }
-
-  return events;
 }
 
 // Buffered line reader for streaming data

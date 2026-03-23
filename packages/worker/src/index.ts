@@ -1,7 +1,9 @@
 import pino from 'pino';
 import { loadConfig } from './config.js';
-import { Connection } from './connection.js';
+import { Connection, type WorkerTlsConfig } from './connection.js';
 import { Executor } from './executor.js';
+import { installCredentialExitHandler, sweepOrphanedCredentialFiles } from './credentialInjector.js';
+import { startHealthProbe } from './healthProbe.js';
 import type { ExecAssign } from '@dac-cloud/shared';
 
 const logger = pino({ level: process.env['LOG_LEVEL'] || 'info' });
@@ -12,6 +14,10 @@ async function main() {
   const config = loadConfig();
   logger.info({ workerId: config.workerId, orchestratorUrl: config.orchestratorUrl }, 'Configuration loaded');
 
+  // Clean up any credential files left behind by a previous crash
+  installCredentialExitHandler(logger);
+  await sweepOrphanedCredentialFiles(logger);
+
   const executor = new Executor(logger);
   let currentExecutionId: string | null = null;
 
@@ -21,6 +27,15 @@ async function main() {
     config.workerToken,
     {
       onAssign(msg: ExecAssign) {
+        if (currentExecutionId || executor.isBusy()) {
+          logger.warn(
+            { executionId: msg.executionId, currentExecutionId },
+            'Received assignment while busy, sending busy nack',
+          );
+          connection.sendBusy(msg.executionId, 'Worker is already executing');
+          return;
+        }
+
         currentExecutionId = msg.executionId;
 
         executor.execute(msg, {
@@ -33,12 +48,16 @@ async function main() {
             connection.sendStderr(msg.executionId, chunk);
           },
 
-          onEvent(eventType: string, payload: unknown) {
+          onEvent(eventType, payload) {
             connection.sendEvent(msg.executionId, eventType, payload);
           },
 
-          onComplete(status, exitCode, durationMs, sessionId, totalCostUsd) {
-            connection.sendComplete(msg.executionId, status, exitCode, durationMs, sessionId, totalCostUsd);
+          onProgress(phase: string, percent: number, detail?: string) {
+            connection.sendProgress(msg.executionId, phase, percent, detail);
+          },
+
+          onComplete(status, exitCode, durationMs, sessionId, totalCostUsd, phaseTimings) {
+            connection.sendComplete(msg.executionId, status, exitCode, durationMs, sessionId, totalCostUsd, phaseTimings);
             currentExecutionId = null;
 
             // Signal ready for next assignment
@@ -84,33 +103,56 @@ async function main() {
       },
     },
     logger,
+    // Pass TLS config if CA or client certs are configured
+    (config.tlsCaPath || config.tlsCertPath) ? {
+      caPath: config.tlsCaPath,
+      certPath: config.tlsCertPath,
+      keyPath: config.tlsKeyPath,
+      rejectUnauthorized: config.tlsRejectUnauthorized,
+    } as WorkerTlsConfig : undefined,
+    { imageDigest: config.imageDigest, claudeCliVersion: config.claudeCliVersion },
   );
 
   // Connect to orchestrator
   connection.connect();
 
-  // Graceful shutdown
-  function shutdown() {
+  // Start health probe if configured
+  let healthServer: import('node:http').Server | undefined;
+  if (config.healthPort > 0) {
+    healthServer = startHealthProbe(
+      config.healthPort,
+      connection,
+      executor,
+      config.workerId,
+      logger,
+    );
+  }
+
+  // Graceful shutdown — waits for sandbox/credential cleanup before exiting
+  let shuttingDown = false;
+  async function shutdown() {
+    if (shuttingDown) return;   // prevent double-shutdown
+    shuttingDown = true;
     logger.info('Shutting down worker...');
+    healthServer?.close();
     connection.disconnect();
+
+    // Drain the executor's finally-block cleanup (sandbox dirs, credential
+    // files, proxy) before calling process.exit so nothing is leaked.
+    await executor.waitForCleanup();
     process.exit(0);
   }
 
-  process.on('SIGINT', () => {
+  const onTermSignal = () => {
     if (currentExecutionId) {
-      logger.info('SIGINT received, killing current execution');
+      logger.info('Termination signal received, killing current execution');
       executor.kill();
     }
     shutdown();
-  });
+  };
 
-  process.on('SIGTERM', () => {
-    if (currentExecutionId) {
-      logger.info('SIGTERM received, killing current execution');
-      executor.kill();
-    }
-    shutdown();
-  });
+  process.on('SIGINT', onTermSignal);
+  process.on('SIGTERM', onTermSignal);
 
   logger.info('DAC Cloud Worker started');
 }

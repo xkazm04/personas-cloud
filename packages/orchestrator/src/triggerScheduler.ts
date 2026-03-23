@@ -1,125 +1,406 @@
 import type Database from 'better-sqlite3';
 import type { Logger } from 'pino';
-import * as db from './db.js';
+import * as db from './db/index.js';
+import { TriggerHeap, type HeapEntry } from './triggerHeap.js';
+import type { TenantDbManager } from './tenantDbManager.js';
+
+const MIN_DELAY_MS = 100;
+const MAX_DELAY_MS = 60_000;
+const HEARTBEAT_INTERVAL_MS = 60_000;
+
+export type ErrorClass = 'config_error' | 'db_error' | 'orphan_trigger';
+
+function zeroErrorCounts(): Record<ErrorClass, number> {
+  return { config_error: 0, db_error: 0, orphan_trigger: 0 };
+}
+
+export interface SchedulerMetrics {
+  heap_size: number;
+  next_due_at: string | null;
+  triggers_fired_total: number;
+  triggers_missed_total: number;
+  avg_tick_latency_ms: number;
+  last_tick_at: string | null;
+  errors_by_class: Record<ErrorClass, number>;
+}
+
+export interface TriggerSchedulerHandle {
+  /** Stop the scheduler. */
+  close(): void;
+  /** Nudge the scheduler to re-evaluate immediately (e.g. after trigger create/update). */
+  nudge(): void;
+  /** Push or update a trigger in the heap after CRUD. */
+  heapPush(triggerId: string, tenantId: string, nextTriggerAt: string | null): void;
+  /** Remove a trigger from the heap (e.g. after delete or disable). */
+  heapRemove(triggerId: string): void;
+  /** Return current scheduler metrics for observability. */
+  getMetrics(): SchedulerMetrics;
+}
 
 /**
- * Start the trigger scheduler loop.
- * Ported from desktop engine/background.rs::trigger_scheduler_tick().
+ * Start the heap-driven trigger scheduler.
  *
- * Runs every `interval` ms (default 5s), evaluates due triggers,
- * and publishes events to the event bus (DB-backed).
+ * On startup the scheduler loads all enabled triggers from the DB into an
+ * in-memory min-heap keyed by next_trigger_at.  On each tick it pops entries
+ * whose time has passed, fires them, and pushes the updated next-fire times
+ * back into the heap.  The DB remains the source of truth — the heap is a
+ * hot-path cache that eliminates full table scans.
  */
 export function startTriggerScheduler(
-  database: Database.Database,
+  database: Database.Database | null,
   logger: Logger,
-  interval: number = 5000,
-): NodeJS.Timeout {
-  logger.info({ intervalMs: interval }, 'Trigger scheduler started');
+  _interval?: number, // kept for signature compat; ignored
+  tenantDbManager?: TenantDbManager,
+  onEventPublished?: () => void,
+): TriggerSchedulerHandle {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  let stopped = false;
+  const heap = new TriggerHeap();
 
-  return setInterval(() => {
+  // ---- Metrics accumulators ----
+  let triggersFiredTotal = 0;
+  let triggersMissedTotal = 0;
+  let tickCount = 0;
+  let tickLatencySum = 0;
+  let lastTickAt: number | null = null;
+  /** Per-tick missed counts since last heartbeat, for correlation. */
+  let tickMissedCounts: number[] = [];
+  const errorsByClass = zeroErrorCounts();
+  const errorsSinceHeartbeat = zeroErrorCounts();
+
+  // ---- Heap bootstrap: load all enabled triggers from DB ----
+  const bootstrap = buildHeap(heap, database, tenantDbManager, logger);
+
+  logger.info(
+    { heapSize: heap.size, minDelayMs: MIN_DELAY_MS, maxDelayMs: MAX_DELAY_MS, tenantIsolated: !!tenantDbManager, bootstrapDurationMs: bootstrap.totalDurationMs },
+    'Heap-driven trigger scheduler started',
+  );
+
+  function scheduleTick(delayMs: number): void {
+    if (stopped) return;
+    timer = setTimeout(tick, delayMs);
+  }
+
+  function tick(): void {
+    if (stopped) return;
+    const tickStart = Date.now();
     try {
-      triggerSchedulerTick(database, logger);
+      const now = tickStart;
+      const due = heap.popDue(now);
+
+      if (due.length > 0) {
+        const result = fireDueEntries(due, now, database, tenantDbManager, heap, logger, onEventPublished);
+        triggersFiredTotal += result.fired;
+        triggersMissedTotal += result.missed;
+        if (result.missed > 0) {
+          tickMissedCounts.push(result.missed);
+        }
+        for (const cls of Object.keys(result.errors) as ErrorClass[]) {
+          errorsByClass[cls] += result.errors[cls];
+          errorsSinceHeartbeat[cls] += result.errors[cls];
+        }
+      }
     } catch (err) {
       logger.error({ err }, 'Trigger scheduler tick failed');
     }
-  }, interval);
+
+    // Track tick latency
+    const tickEnd = Date.now();
+    tickCount++;
+    tickLatencySum += tickEnd - tickStart;
+    lastTickAt = tickEnd;
+
+    // Schedule next tick based on heap peek
+    const delayMs = computeNextDelay(heap);
+    scheduleTick(delayMs);
+  }
+
+  // Kick off the first tick immediately
+  scheduleTick(0);
+
+  // ---- Heartbeat log every 60 seconds ----
+  heartbeatTimer = setInterval(() => {
+    if (stopped) return;
+    const top = heap.peek();
+    const missedSinceLastHeartbeat = tickMissedCounts.reduce((a, b) => a + b, 0);
+    logger.info({
+      heap_size: heap.size,
+      next_due_at: top ? new Date(top.nextTriggerAt).toISOString() : null,
+      triggers_fired_total: triggersFiredTotal,
+      triggers_missed_total: triggersMissedTotal,
+      triggers_missed_since_last_heartbeat: missedSinceLastHeartbeat,
+      missed_per_tick: tickMissedCounts.length > 0 ? tickMissedCounts : undefined,
+      avg_tick_latency_ms: tickCount > 0 ? Math.round(tickLatencySum / tickCount * 100) / 100 : 0,
+      last_tick_at: lastTickAt ? new Date(lastTickAt).toISOString() : null,
+      errors_by_class: errorsByClass,
+      errors_since_heartbeat: errorsSinceHeartbeat,
+    }, 'Scheduler heartbeat');
+    tickMissedCounts = [];
+    errorsSinceHeartbeat.config_error = 0;
+    errorsSinceHeartbeat.db_error = 0;
+    errorsSinceHeartbeat.orphan_trigger = 0;
+  }, HEARTBEAT_INTERVAL_MS);
+
+  return {
+    close() {
+      stopped = true;
+      if (timer != null) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      if (heartbeatTimer != null) {
+        clearInterval(heartbeatTimer);
+        heartbeatTimer = null;
+      }
+    },
+    nudge() {
+      if (stopped) return;
+      if (timer != null) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      scheduleTick(0);
+    },
+    heapPush(triggerId: string, tenantId: string, nextTriggerAt: string | null) {
+      if (!nextTriggerAt) {
+        heap.remove(triggerId);
+        return;
+      }
+      heap.push({ triggerId, tenantId, nextTriggerAt: new Date(nextTriggerAt).getTime() });
+    },
+    heapRemove(triggerId: string) {
+      heap.remove(triggerId);
+    },
+    getMetrics(): SchedulerMetrics {
+      const top = heap.peek();
+      return {
+        heap_size: heap.size,
+        next_due_at: top ? new Date(top.nextTriggerAt).toISOString() : null,
+        triggers_fired_total: triggersFiredTotal,
+        triggers_missed_total: triggersMissedTotal,
+        avg_tick_latency_ms: tickCount > 0 ? Math.round(tickLatencySum / tickCount * 100) / 100 : 0,
+        last_tick_at: lastTickAt ? new Date(lastTickAt).toISOString() : null,
+        errors_by_class: { ...errorsByClass },
+      };
+    },
+  };
 }
 
-function triggerSchedulerTick(
-  database: Database.Database,
+// ---------------------------------------------------------------------------
+// Heap bootstrap — load all enabled triggers from every tenant DB
+// ---------------------------------------------------------------------------
+
+interface BootstrapSummary {
+  totalDurationMs: number;
+  tenantCount: number;
+  triggerCount: number;
+  failedTenants: number;
+}
+
+function buildHeap(
+  heap: TriggerHeap,
+  database: Database.Database | null,
+  tenantDbManager: TenantDbManager | undefined,
   logger: Logger,
-): void {
-  const triggers = db.getDueTriggers(database);
-  if (triggers.length === 0) return;
+): BootstrapSummary {
+  const startMs = Date.now();
+  heap.clear();
 
-  for (const trigger of triggers) {
-    // Skip polling triggers (handled separately if needed)
-    if (trigger.triggerType === 'polling') continue;
+  let tenantCount = 0;
+  let triggerCount = 0;
+  let failedTenants = 0;
 
+  if (tenantDbManager) {
+    const tenantIds = tenantDbManager.listTenantIds();
+    for (const tenantId of tenantIds) {
+      tenantCount++;
+      const heapSizeBefore = heap.size;
+      try {
+        const tenantDb = tenantDbManager.getTenantDb(tenantId);
+        const loaded = loadDbIntoHeap(heap, tenantDb, tenantId);
+        triggerCount += loaded;
+        logger.debug({ tenantId, triggerCount: loaded }, 'Loaded tenant triggers into heap');
+      } catch (err) {
+        const loadedBeforeFailure = heap.size - heapSizeBefore;
+        failedTenants++;
+        logger.error({ err, tenantId, triggersLoadedBeforeFailure: loadedBeforeFailure }, 'Failed to load triggers for tenant into heap');
+      }
+    }
+  } else if (database) {
+    tenantCount = 1;
+    const loaded = loadDbIntoHeap(heap, database, 'default');
+    triggerCount += loaded;
+  }
+
+  const totalDurationMs = Date.now() - startMs;
+  const summary: BootstrapSummary = { totalDurationMs, tenantCount, triggerCount, failedTenants };
+  logger.info(summary, 'Heap bootstrap complete');
+  return summary;
+}
+
+function loadDbIntoHeap(heap: TriggerHeap, dbConn: Database.Database, tenantId: string): number {
+  const rows = db.loadEnabledTriggerTimes(dbConn);
+  for (const row of rows) {
+    heap.push({
+      triggerId: row.id,
+      tenantId,
+      nextTriggerAt: new Date(row.nextTriggerAt).getTime(),
+    });
+  }
+  return rows.length;
+}
+
+// ---------------------------------------------------------------------------
+// Compute next delay from the heap (O(1) peek)
+// ---------------------------------------------------------------------------
+
+function computeNextDelay(heap: TriggerHeap): number {
+  const top = heap.peek();
+  if (!top) return MAX_DELAY_MS;
+  const deltaMs = top.nextTriggerAt - Date.now();
+  return Math.min(MAX_DELAY_MS, Math.max(MIN_DELAY_MS, deltaMs));
+}
+
+// ---------------------------------------------------------------------------
+// Fire due triggers — batch-fetch from DB by ID, then process
+// ---------------------------------------------------------------------------
+
+function fireDueEntries(
+  due: HeapEntry[],
+  tickNow: number,
+  database: Database.Database | null,
+  tenantDbManager: TenantDbManager | undefined,
+  heap: TriggerHeap,
+  logger: Logger,
+  onEventPublished?: () => void,
+): { fired: number; missed: number; errors: Record<ErrorClass, number> } {
+  let firedCount = 0;
+  let missedCount = 0;
+  const errors = zeroErrorCounts();
+
+  // Build latency lookup from heap entries for missed-trigger detection
+  const scheduledAtByTriggerId = new Map<string, number>();
+  for (const entry of due) {
+    scheduledAtByTriggerId.set(entry.triggerId, entry.nextTriggerAt);
+  }
+
+  // Group by tenantId so we hit each DB once with a batch query
+  const byTenant = new Map<string, HeapEntry[]>();
+  for (const entry of due) {
+    let list = byTenant.get(entry.tenantId);
+    if (!list) {
+      list = [];
+      byTenant.set(entry.tenantId, list);
+    }
+    list.push(entry);
+  }
+
+  for (const [tenantId, entries] of byTenant) {
     try {
-      // Parse config
-      let eventType = 'trigger_fired';
-      let payload: string | null = null;
+      const tenantDb = tenantDbManager
+        ? tenantDbManager.getTenantDb(tenantId)
+        : database;
+      if (!tenantDb) continue;
 
-      if (trigger.config) {
-        try {
-          const config = JSON.parse(trigger.config) as {
-            event_type?: string;
-            payload?: unknown;
-            cron?: string;
-          };
-          if (config.event_type) eventType = config.event_type;
-          if (config.payload) payload = JSON.stringify(config.payload);
-        } catch {
-          // Invalid config JSON, use defaults
-        }
-      }
+      const ids = entries.map(e => e.triggerId);
+      const triggers = db.getTriggersByIdsWithPersona(tenantDb, ids);
 
-      // Look up persona to get its projectId for event isolation
-      const persona = db.getPersona(database, trigger.personaId);
-      const triggerProjectId = persona?.projectId;
+      for (const trigger of triggers) {
+        // Skip polling triggers
+        if (trigger.triggerType === 'polling') continue;
 
-      // Publish event to bus
-      db.publishEvent(database, {
-        eventType,
-        sourceType: 'trigger',
-        sourceId: trigger.id,
-        targetPersonaId: trigger.personaId,
-        projectId: triggerProjectId,
-        useCaseId: trigger.useCaseId,
-        payload,
-      });
-
-      // Compute next trigger time
-      const now = new Date().toISOString();
-      let nextTriggerAt: string | null = null;
-
-      if (trigger.triggerType === 'schedule' && trigger.config) {
-        try {
-          const config = JSON.parse(trigger.config) as { cron?: string; interval_seconds?: number };
-          if (config.cron) {
-            nextTriggerAt = computeNextCron(config.cron);
-          } else if (config.interval_seconds) {
-            const next = new Date(Date.now() + config.interval_seconds * 1000);
-            nextTriggerAt = next.toISOString();
+        // Detect missed trigger (due more than 60 s ago) and log with full context
+        const scheduledAt = scheduledAtByTriggerId.get(trigger.id);
+        if (scheduledAt !== undefined) {
+          const latencyMs = tickNow - scheduledAt;
+          if (latencyMs > MAX_DELAY_MS) {
+            missedCount++;
+            logger.warn({
+              triggerId: trigger.id,
+              tenantId,
+              personaId: trigger.personaId,
+              scheduledAt: new Date(scheduledAt).toISOString(),
+              latencyMs,
+            }, 'Missed trigger: fired late');
           }
-        } catch {
-          // Cannot compute next, trigger won't fire again until updated
+        }
+
+        // Phase tracks which operation we're in for error classification
+        let phase: ErrorClass = 'config_error';
+        try {
+          const parsedConfig = trigger.parsedConfig;
+          let eventType = 'trigger_fired';
+          let payload: string | null = null;
+          if (parsedConfig) {
+            if (parsedConfig.event_type) eventType = parsedConfig.event_type;
+            if (parsedConfig.payload) payload = JSON.stringify(parsedConfig.payload);
+          }
+
+          // Skip triggers for deleted or disabled personas
+          if (trigger.personaProjectId == null) {
+            errors.orphan_trigger++;
+            logger.warn({ triggerId: trigger.id, personaId: trigger.personaId, error_class: 'orphan_trigger' as ErrorClass }, 'Skipping trigger: persona not found (deleted?)');
+            continue;
+          }
+          if (!trigger.personaEnabled) {
+            errors.orphan_trigger++;
+            logger.debug({ triggerId: trigger.id, personaId: trigger.personaId, error_class: 'orphan_trigger' as ErrorClass }, 'Skipping trigger: persona is disabled');
+            continue;
+          }
+
+          const triggerProjectId = tenantId !== 'default' ? tenantId : trigger.personaProjectId;
+
+          // DB operations phase
+          phase = 'db_error';
+
+          // Publish event
+          const publishedEvent = db.publishEvent(tenantDb, {
+            eventType,
+            sourceType: 'trigger',
+            sourceId: trigger.id,
+            targetPersonaId: trigger.personaId,
+            projectId: triggerProjectId,
+            useCaseId: trigger.useCaseId,
+            payload,
+          });
+          onEventPublished?.();
+
+          // Record fire history
+          db.recordTriggerFire(tenantDb, {
+            triggerId: trigger.id,
+            eventId: publishedEvent.id,
+          });
+
+          // Compute next trigger time (config operation) and update DB
+          phase = 'config_error';
+          const now = new Date().toISOString();
+          const nextTriggerAt = db.computeNextTriggerAtFromParsed(trigger.triggerType, parsedConfig);
+
+          phase = 'db_error';
+          db.updateTriggerTimings(tenantDb, trigger.id, now, nextTriggerAt);
+
+          // Push updated time back into heap
+          if (nextTriggerAt) {
+            heap.push({ triggerId: trigger.id, tenantId, nextTriggerAt: new Date(nextTriggerAt).getTime() });
+          }
+
+          logger.info({
+            triggerId: trigger.id,
+            personaId: trigger.personaId,
+            eventType,
+            nextTriggerAt,
+          }, 'Trigger fired');
+          firedCount++;
+        } catch (err) {
+          errors[phase]++;
+          logger.error({ err, triggerId: trigger.id, error_class: phase }, 'Failed to fire trigger');
         }
       }
-
-      db.updateTriggerTimings(database, trigger.id, now, nextTriggerAt);
-
-      logger.info({
-        triggerId: trigger.id,
-        personaId: trigger.personaId,
-        eventType,
-        nextTriggerAt,
-      }, 'Trigger fired');
     } catch (err) {
-      logger.error({ err, triggerId: trigger.id }, 'Failed to fire trigger');
+      errors.db_error++;
+      logger.error({ err, tenantId, error_class: 'db_error' as ErrorClass }, 'Trigger scheduler tick failed for tenant');
     }
   }
-}
-
-/**
- * Simple cron next-time computation.
- * Supports basic interval-based patterns. For full cron support,
- * add cron-parser dependency later.
- */
-function computeNextCron(cron: string): string | null {
-  // Basic patterns: "every Xm", "every Xh", "every Xs"
-  const match = cron.match(/^every\s+(\d+)([smhd])$/i);
-  if (match) {
-    const value = parseInt(match[1]!, 10);
-    const unit = match[2]!.toLowerCase();
-    const multipliers: Record<string, number> = { s: 1000, m: 60000, h: 3600000, d: 86400000 };
-    const ms = value * (multipliers[unit] ?? 60000);
-    return new Date(Date.now() + ms).toISOString();
-  }
-
-  // Standard cron — attempt basic parsing for common patterns
-  // For now, default to 1 hour if we can't parse
-  // TODO: Add cron-parser for full cron support
-  return new Date(Date.now() + 3600000).toISOString();
+  return { fired: firedCount, missed: missedCount, errors };
 }

@@ -1,21 +1,33 @@
 import WebSocket from 'ws';
+import fs from 'node:fs';
 import {
-  parseMessage,
+  parseOrchestratorMessage,
   serializeMessage,
   PROTOCOL_VERSION,
   type OrchestratorMessage,
+  type ExecAssign,
+  type ExecCancel,
+  type OrchestratorShutdown,
   type WorkerMessage,
+  type PhaseTimings,
 } from '@dac-cloud/shared';
 import type { Logger } from 'pino';
+
+export interface WorkerTlsConfig {
+  caPath: string;
+  certPath: string;
+  keyPath: string;
+  rejectUnauthorized: boolean;
+}
 
 const HEARTBEAT_INTERVAL_MS = 30_000;
 const MAX_RECONNECT_DELAY_MS = 30_000;
 const INITIAL_RECONNECT_DELAY_MS = 1_000;
 
 export interface ConnectionCallbacks {
-  onAssign(msg: OrchestratorMessage & { type: 'assign' }): void;
-  onCancel(msg: OrchestratorMessage & { type: 'cancel' }): void;
-  onShutdown(msg: OrchestratorMessage & { type: 'shutdown' }): void;
+  onAssign(msg: ExecAssign): void;
+  onCancel(msg: ExecCancel): void;
+  onShutdown(msg: OrchestratorShutdown): void;
 }
 
 export class Connection {
@@ -26,22 +38,52 @@ export class Connection {
   private reconnectTimer?: ReturnType<typeof setTimeout>;
   private shuttingDown = false;
 
+  private tlsConfig?: WorkerTlsConfig;
+  private cachedTlsOptions?: Pick<WebSocket.ClientOptions, 'ca' | 'cert' | 'key' | 'rejectUnauthorized'>;
+
+  private imageDigest: string;
+  private claudeCliVersion: string;
+
   constructor(
     private orchestratorUrl: string,
     private workerId: string,
     private workerToken: string,
     private callbacks: ConnectionCallbacks,
     private logger: Logger,
-  ) {}
+    tlsConfig?: WorkerTlsConfig,
+    opts?: { imageDigest?: string; claudeCliVersion?: string },
+  ) {
+    this.tlsConfig = tlsConfig;
+    this.imageDigest = opts?.imageDigest || '';
+    this.claudeCliVersion = opts?.claudeCliVersion || '';
+
+    if (tlsConfig) {
+      this.cachedTlsOptions = {
+        rejectUnauthorized: tlsConfig.rejectUnauthorized,
+      };
+      if (tlsConfig.caPath) {
+        this.cachedTlsOptions.ca = fs.readFileSync(tlsConfig.caPath);
+      }
+      if (tlsConfig.certPath && tlsConfig.keyPath) {
+        this.cachedTlsOptions.cert = fs.readFileSync(tlsConfig.certPath);
+        this.cachedTlsOptions.key = fs.readFileSync(tlsConfig.keyPath);
+      }
+    }
+  }
 
   connect(): void {
     if (this.shuttingDown) return;
 
     this.logger.info({ url: this.orchestratorUrl, workerId: this.workerId }, 'Connecting to orchestrator');
 
-    // Append worker token as query parameter for authentication
-    const urlWithToken = `${this.orchestratorUrl}?token=${encodeURIComponent(this.workerToken)}`;
-    this.ws = new WebSocket(urlWithToken);
+    const wsOptions: WebSocket.ClientOptions = {
+      ...this.cachedTlsOptions,
+      headers: {
+        Authorization: `Bearer ${this.workerToken}`,
+      },
+    };
+
+    this.ws = new WebSocket(this.orchestratorUrl, wsOptions);
 
     this.ws.on('open', () => {
       this.connected = true;
@@ -52,7 +94,9 @@ export class Connection {
         type: 'hello',
         workerId: this.workerId,
         version: PROTOCOL_VERSION,
-        capabilities: ['claude-cli', 'node', 'git'],
+        capabilities: ['claude-cli', 'node', 'git', 'network-policy'],
+        ...(this.imageDigest ? { imageDigest: this.imageDigest } : {}),
+        ...(this.claudeCliVersion ? { claudeCliVersion: this.claudeCliVersion } : {}),
       });
 
       // Start heartbeat
@@ -64,7 +108,7 @@ export class Connection {
     });
 
     this.ws.on('message', (raw: Buffer) => {
-      const msg = parseMessage<OrchestratorMessage>(raw.toString());
+      const msg = parseOrchestratorMessage(raw.toString());
       if (!msg) {
         this.logger.warn('Invalid message from orchestrator');
         return;
@@ -95,18 +139,18 @@ export class Connection {
 
       case 'assign':
         this.logger.info({ executionId: msg.executionId, personaId: msg.personaId }, 'Received execution assignment');
-        this.callbacks.onAssign(msg as any);
+        this.callbacks.onAssign(msg);
         break;
 
       case 'cancel':
         this.logger.info({ executionId: msg.executionId }, 'Received cancel');
-        this.callbacks.onCancel(msg as any);
+        this.callbacks.onCancel(msg);
         break;
 
       case 'shutdown':
         this.logger.info({ reason: msg.reason }, 'Received shutdown');
         this.shuttingDown = true;
-        this.callbacks.onShutdown(msg as any);
+        this.callbacks.onShutdown(msg);
         break;
 
       case 'heartbeat':
@@ -127,6 +171,10 @@ export class Connection {
 
   sendReady(): void {
     this.send({ type: 'ready' });
+  }
+
+  sendBusy(executionId: string, reason: string): void {
+    this.send({ type: 'busy', executionId, reason });
   }
 
   sendStdout(executionId: string, chunk: string): void {
@@ -154,6 +202,7 @@ export class Connection {
     durationMs: number,
     sessionId?: string,
     totalCostUsd?: number,
+    phaseTimings?: PhaseTimings,
   ): void {
     this.send({
       type: 'complete',
@@ -163,14 +212,26 @@ export class Connection {
       durationMs,
       sessionId,
       totalCostUsd,
+      phaseTimings,
     });
   }
 
-  sendEvent(executionId: string, eventType: string, payload: unknown): void {
+  sendProgress(executionId: string, phase: string, percent: number, detail?: string): void {
+    this.send({
+      type: 'progress',
+      executionId,
+      phase,
+      percent,
+      detail,
+      timestamp: Date.now(),
+    });
+  }
+
+  sendEvent(executionId: string, eventType: import('@dac-cloud/shared').ProtocolEventType, payload: unknown): void {
     this.send({
       type: 'event',
       executionId,
-      eventType: eventType as any,
+      eventType,
       payload,
     });
   }
@@ -209,5 +270,11 @@ export class Connection {
 
   isConnected(): boolean {
     return this.connected;
+  }
+
+  getConnectionState(): 'connected' | 'reconnecting' | 'disconnected' {
+    if (this.connected) return 'connected';
+    if (this.shuttingDown) return 'disconnected';
+    return 'reconnecting';
   }
 }

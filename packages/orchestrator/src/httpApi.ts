@@ -1,14 +1,66 @@
 import http from 'node:http';
 import { nanoid } from 'nanoid';
-import type { ExecRequest, Persona, PersonaToolDefinition } from '@dac-cloud/shared';
+import { encrypt, createPersonaWithDefaults, createToolDefinitionWithDefaults, type ExecRequest, type Persona, type PersonaToolDefinition } from '@dac-cloud/shared';
 import type Database from 'better-sqlite3';
 import type { Auth, RequestContext } from './auth.js';
-import type { Dispatcher } from './dispatcher.js';
+import type { Dispatcher, SubmitResult } from './dispatcher.js';
 import type { WorkerPool } from './workerPool.js';
 import type { TokenManager } from './tokenManager.js';
 import type { OAuthManager } from './oauth.js';
+import type { KafkaClient } from './kafka.js';
+import { handleOAuthRoute } from './oauthHttpHandlers.js';
+import { handleTriggerRoute } from './triggerHttpHandlers.js';
+import type { TriggerSchedulerHandle } from './triggerScheduler.js';
+import type { TenantDbManager } from './tenantDbManager.js';
+import type { TenantKeyManager } from './tenantKeyManager.js';
+import type { AuditLog, AuditEntry, AuditAction, AuditLogHealth } from './auditLog.js';
+import type { EventProcessorHealth } from './eventProcessor.js';
+import type { RetentionHealth } from './retention.js';
 import type { Logger } from 'pino';
-import * as db from './db.js';
+import * as db from './db/index.js';
+import { readBody, json } from './httpUtils.js';
+
+// --- Route types ---
+
+interface ParsedRoute {
+  resource: string;
+  id?: string;
+  subResource?: string;
+}
+
+type RouteHandler = (
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  ctx: RequestContext,
+  route: ParsedRoute | null,
+  queryString: string | undefined,
+  tenantDb: Database.Database | undefined,
+  scopedProjectId: string | undefined,
+  reqLogger: Logger,
+) => Promise<void> | void;
+
+interface RouteEntry {
+  handler: RouteHandler;
+  needsDb?: boolean;
+  adminOnly?: boolean;
+}
+
+/** Build a lookup key for resource-based routes: `METHOD:resource[:id][:subResource]` */
+function resourceKey(method: string, resource: string, hasId: boolean, subResource?: string): string {
+  return `${method}:${resource}${hasId ? ':id' : ''}${subResource ? ':' + subResource : ''}`;
+}
+
+/** Parse `/api/{resource}[/{id}[/{subResource}]]` into structured parts. */
+function parseRoute(pathname: string): ParsedRoute | null {
+  if (!pathname.startsWith('/api/')) return null;
+  const segments = pathname.slice(5).split('/').filter(Boolean);
+  if (segments.length === 0) return null;
+  return {
+    resource: segments[0]!,
+    id: segments[1],
+    subResource: segments[2],
+  };
+}
 
 export function createHttpApi(
   auth: Auth,
@@ -18,10 +70,569 @@ export function createHttpApi(
   oauth: OAuthManager,
   logger: Logger,
   database?: Database.Database,
+  tenantDbManager?: TenantDbManager,
+  tenantKeyManager?: TenantKeyManager,
+  auditLog?: AuditLog,
+  getEventProcessorHealth?: () => EventProcessorHealth,
+  kafka?: KafkaClient,
+  onEventPublished?: () => void,
+  triggerScheduler?: TriggerSchedulerHandle,
+  getRetentionHealth?: () => RetentionHealth,
 ): http.Server {
+
+  /** Wrap a mutation handler to emit an audit event on successful response. */
+  function withHttpAudit(handler: RouteHandler, action: AuditAction, resourceType: string): RouteHandler {
+    return async (req, res, ctx, route, qs, tenantDb, scopedProjectId, reqLogger) => {
+      await handler(req, res, ctx, route, qs, tenantDb, scopedProjectId, reqLogger);
+      if (res.statusCode >= 200 && res.statusCode < 300 && auditLog) {
+        try {
+          auditLog.record({
+            action,
+            tenantId: ctx.projectId || 'default',
+            actor: ctx.userEmail || ctx.projectId,
+            resourceType,
+            resourceId: route?.id,
+            ipAddress: req.socket.remoteAddress,
+          } as AuditEntry);
+        } catch { /* logged inside record() */ }
+      }
+    };
+  }
+
+  // ── Exact-path route table (O(1) lookup by `METHOD:/path`) ──
+  const exactRoutes = new Map<string, RouteEntry>();
+
+  // OAuth + token injection (admin-only, delegated to oauthHttpHandlers)
+  for (const [path, method] of [
+    ['/api/oauth/authorize', 'POST'],
+    ['/api/oauth/callback', 'POST'],
+    ['/api/oauth/status', 'GET'],
+    ['/api/oauth/refresh', 'POST'],
+    ['/api/oauth/disconnect', 'DELETE'],
+    ['/api/token', 'POST'],
+  ] as const) {
+    exactRoutes.set(`${method}:${path}`, {
+      adminOnly: true,
+      handler: async (req, res, _ctx, _route, _qs, _tenantDb, _scopedProjectId, reqLogger) => {
+        await handleOAuthRoute(path, method, req, res, oauth, tokenManager, reqLogger, auditLog);
+      },
+    });
+  }
+
+  exactRoutes.set('GET:/api/status', {
+    handler: (_req, res) => {
+      handleStatus(res, pool, dispatcher, tokenManager, oauth);
+    },
+  });
+
+  exactRoutes.set('POST:/api/execute', {
+    handler: withHttpAudit(async (req, res, ctx, _route, _qs, _tenantDb, _scopedProjectId, reqLogger) => {
+      await handleExecute(req, res, dispatcher, reqLogger, ctx);
+    }, 'execution:submit', 'execution'),
+  });
+
+  exactRoutes.set('POST:/api/gitlab/webhook', {
+    needsDb: true,
+    handler: withHttpAudit(async (req, res, _ctx, _route, _qs, tenantDb) => {
+      const body = await readBody(req);
+      let parsed: Record<string, unknown> = {};
+      try { parsed = JSON.parse(body); } catch { /* raw payload */ }
+      const objectKind = (parsed['object_kind'] as string) || 'unknown';
+      const projectPath = (parsed['project'] as Record<string, unknown>)?.['path_with_namespace'] as string | undefined;
+      const event = db.publishEvent(tenantDb!, {
+        eventType: `gitlab_${objectKind}`,
+        sourceType: 'gitlab',
+        sourceId: projectPath ?? null,
+        payload: body,
+      });
+      onEventPublished?.();
+      json(res, 201, event);
+    }, 'event:publish', 'event'),
+  });
+
+  // Admin routes
+  exactRoutes.set('GET:/api/admin/users', {
+    adminOnly: true,
+    handler: (_req, res) => {
+      if (tenantDbManager) {
+        json(res, 200, { projectIds: tenantDbManager.listTenantIds() });
+      } else if (database) {
+        json(res, 200, { projectIds: db.listDistinctProjectIds(database) });
+      } else {
+        json(res, 200, { projectIds: [] });
+      }
+    },
+  });
+
+  exactRoutes.set('GET:/api/admin/personas', {
+    adminOnly: true,
+    handler: (_req, res) => {
+      if (tenantDbManager) {
+        const allPersonas: import('@dac-cloud/shared').PersonaSummary[] = [];
+        tenantDbManager.forEachTenant((tDb) => { allPersonas.push(...db.listPersonasSummary(tDb)); });
+        json(res, 200, allPersonas);
+      } else if (database) {
+        json(res, 200, db.listPersonasSummary(database));
+      } else {
+        json(res, 200, []);
+      }
+    },
+  });
+
+  exactRoutes.set('GET:/api/admin/executions', {
+    adminOnly: true,
+    handler: (_req, res, _ctx, _route, queryString) => {
+      const params = new URLSearchParams(queryString || '');
+      const limit = clampQueryInt(params.get('limit'), 100, MAX_QUERY_LIMIT);
+      if (tenantDbManager) {
+        const allExecs: import('@dac-cloud/shared').PersonaExecution[] = [];
+        tenantDbManager.forEachTenant((tDb) => {
+          allExecs.push(...db.listExecutions(tDb, { limit }));
+        });
+        allExecs.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+        json(res, 200, allExecs.slice(0, limit));
+      } else if (database) {
+        json(res, 200, db.listExecutions(database, {
+          limit,
+          offset: clampQueryInt(params.get('offset'), 0, MAX_QUERY_OFFSET),
+        }));
+      } else {
+        json(res, 200, []);
+      }
+    },
+  });
+
+  exactRoutes.set('GET:/api/admin/audit', {
+    adminOnly: true,
+    handler: (_req, res, _ctx, _route, queryString) => {
+      if (!auditLog) { json(res, 200, []); return; }
+      const params = new URLSearchParams(queryString || '');
+      json(res, 200, auditLog.query({
+        tenantId: params.get('tenantId') ?? undefined,
+        action: (params.get('action') ?? undefined) as AuditAction | undefined,
+        since: params.get('since') ?? undefined,
+        until: params.get('until') ?? undefined,
+        actor: params.get('actor') ?? undefined,
+        resourceType: params.get('resourceType') ?? undefined,
+        resourceId: params.get('resourceId') ?? undefined,
+        limit: clampQueryInt(params.get('limit'), 100, MAX_QUERY_LIMIT),
+        offset: clampQueryInt(params.get('offset'), 0, MAX_QUERY_OFFSET),
+      }));
+    },
+  });
+
+  exactRoutes.set('GET:/api/admin/audit/stats', {
+    adminOnly: true,
+    handler: (_req, res, _ctx, _route, queryString) => {
+      if (!auditLog) { json(res, 200, { byAction: [], byTenant: [], topActors: [], trend: [] }); return; }
+      const params = new URLSearchParams(queryString || '');
+      const bucket = params.get('bucket') === 'hour' ? 'hour' : 'day';
+      json(res, 200, auditLog.stats({
+        tenantId: params.get('tenantId') ?? undefined,
+        since: params.get('since') ?? undefined,
+        until: params.get('until') ?? undefined,
+        bucket,
+      }));
+    },
+  });
+
+  exactRoutes.set('POST:/api/admin/audit/verify', {
+    adminOnly: true,
+    handler: async (req, res) => {
+      if (!auditLog) { json(res, 200, { valid: true, verifiedCount: 0 }); return; }
+      const body = await readBody(req);
+      let opts: { since?: string; until?: string } | undefined;
+      if (body) {
+        try {
+          const parsed = JSON.parse(body) as { since?: string; until?: string };
+          if (parsed.since || parsed.until) opts = { since: parsed.since, until: parsed.until };
+        } catch { /* empty body or non-JSON — verify entire chain */ }
+      }
+      json(res, 200, auditLog.verify(opts));
+    },
+  });
+
+  // Daily metrics endpoint — accessible to authenticated users (scoped to their tenant)
+  // and admins (system-wide aggregation across all tenants).
+  exactRoutes.set('GET:/api/metrics/daily', {
+    handler: (_req, res, ctx, _route, queryString, tenantDb, _scopedProjectId) => {
+      const params = new URLSearchParams(queryString || '');
+      const from = params.get('from') ?? undefined;
+      const to = params.get('to') ?? undefined;
+      const opts = { from, to };
+
+      if (ctx.authType === 'admin' && tenantDbManager) {
+        // Admin: aggregate across all tenants
+        const allDaily: db.DailyMetricsRow[] = [];
+        const allByPersona: db.DailyMetricsByPersonaRow[] = [];
+        tenantDbManager.forEachTenant((tDb) => {
+          allDaily.push(...db.queryDailyMetrics(tDb, opts));
+          allByPersona.push(...db.queryDailyMetricsByPersona(tDb, opts));
+        });
+
+        // Merge daily rows by date
+        const dayMap = new Map<string, db.DailyMetricsRow>();
+        for (const row of allDaily) {
+          const existing = dayMap.get(row.date);
+          if (existing) {
+            existing.totalExecutions += row.totalExecutions;
+            existing.completed += row.completed;
+            existing.failed += row.failed;
+            existing.cancelled += row.cancelled;
+            existing.totalCostUsd += row.totalCostUsd;
+            existing.totalDurationMs += row.totalDurationMs;
+            existing.totalInputTokens += row.totalInputTokens;
+            existing.totalOutputTokens += row.totalOutputTokens;
+            existing.avgDurationMs = existing.totalExecutions > 0
+              ? Math.round(existing.totalDurationMs / existing.totalExecutions) : null;
+          } else {
+            dayMap.set(row.date, { ...row });
+          }
+        }
+        const merged = [...dayMap.values()].sort((a, b) => b.date.localeCompare(a.date));
+
+        json(res, 200, { daily: merged, byPersona: allByPersona });
+      } else {
+        // Tenant-scoped
+        const targetDb = tenantDb ?? database;
+        if (!targetDb) { json(res, 200, { daily: [], byPersona: [] }); return; }
+        json(res, 200, {
+          daily: db.queryDailyMetrics(targetDb, opts),
+          byPersona: db.queryDailyMetricsByPersona(targetDb, opts),
+        });
+      }
+    },
+  });
+
+  // ── Resource route table (O(1) lookup by `METHOD:resource[:id][:sub]`) ──
+  const resourceRoutes = new Map<string, RouteEntry>();
+
+  // --- Persona CRUD ---
+  resourceRoutes.set(resourceKey('GET', 'personas', false), {
+    needsDb: true,
+    handler: (_req, res, _ctx, _route, _qs, tenantDb, scopedProjectId) => {
+      json(res, 200, db.listPersonasSummary(tenantDb!, scopedProjectId));
+    },
+  });
+
+  resourceRoutes.set(resourceKey('POST', 'personas', false), {
+    needsDb: true,
+    handler: async (req, res, ctx, _route, _qs, tenantDb, _scopedProjectId, reqLogger) => {
+      const body = JSON.parse(await readBody(req)) as Partial<Persona>;
+      const persona = createPersonaWithDefaults({
+        ...body,
+        projectIdOverride: ctx.authType === 'user' ? ctx.projectId : undefined,
+      });
+      db.upsertPersona(tenantDb!, persona);
+      try { auditLog?.record({ action: 'persona:create', tenantId: ctx.projectId || 'default', actor: ctx.userEmail || ctx.projectId, resourceType: 'persona', resourceId: persona.id, ipAddress: req.socket.remoteAddress }); } catch { /* logged inside record() */ }
+      reqLogger.info({ op: 'persona.create', resourceType: 'persona', resourceId: persona.id, projectId: ctx.projectId, status: 201 }, 'Persona created');
+      json(res, 201, persona);
+    },
+  });
+
+  resourceRoutes.set(resourceKey('GET', 'personas', true, 'tools'), {
+    needsDb: true,
+    handler: (_req, res, _ctx, route, _qs, tenantDb) => {
+      json(res, 200, db.getToolsForPersona(tenantDb!, route!.id!));
+    },
+  });
+
+  resourceRoutes.set(resourceKey('POST', 'personas', true, 'tools'), {
+    needsDb: true,
+    handler: async (req, res, ctx, route, _qs, tenantDb, scopedProjectId, reqLogger) => {
+      const persona = withScopedEntity(db.getPersona(tenantDb!, route!.id!), scopedProjectId, res);
+      if (!persona) return;
+      const body = JSON.parse(await readBody(req)) as { toolId: string };
+      db.linkTool(tenantDb!, route!.id!, body.toolId);
+      try { auditLog?.record({ action: 'tool:link', tenantId: ctx.projectId || 'default', actor: ctx.userEmail || ctx.projectId, resourceType: 'persona', resourceId: route!.id!, detail: { toolId: body.toolId }, ipAddress: req.socket.remoteAddress }); } catch { /* logged inside record() */ }
+      reqLogger.info({ op: 'persona.linkTool', resourceType: 'persona', resourceId: route!.id!, toolId: body.toolId, projectId: ctx.projectId, status: 200 }, 'Tool linked to persona');
+      json(res, 200, { linked: true });
+    },
+  });
+
+  resourceRoutes.set(resourceKey('GET', 'personas', true, 'full'), {
+    needsDb: true,
+    handler: (_req, res, _ctx, route, _qs, tenantDb, scopedProjectId, reqLogger) => {
+      const hydrated = withScopedEntity(db.getHydratedPersona(tenantDb!, route!.id!, reqLogger), scopedProjectId, res);
+      if (!hydrated) return;
+      json(res, 200, hydrated);
+    },
+  });
+
+  resourceRoutes.set(resourceKey('GET', 'personas', true), {
+    needsDb: true,
+    handler: (_req, res, _ctx, route, _qs, tenantDb, scopedProjectId) => {
+      const persona = withScopedEntity(db.getPersona(tenantDb!, route!.id!), scopedProjectId, res);
+      if (!persona) return;
+      json(res, 200, persona);
+    },
+  });
+
+  resourceRoutes.set(resourceKey('DELETE', 'personas', true), {
+    needsDb: true,
+    handler: (req, res, ctx, route, _qs, tenantDb, scopedProjectId, reqLogger) => {
+      db.deletePersona(tenantDb!, route!.id!, scopedProjectId);
+      try { auditLog?.record({ action: 'persona:delete', tenantId: ctx.projectId || 'default', actor: ctx.userEmail || ctx.projectId, resourceType: 'persona', resourceId: route!.id!, ipAddress: req.socket.remoteAddress }); } catch { /* logged inside record() */ }
+      reqLogger.info({ op: 'persona.delete', resourceType: 'persona', resourceId: route!.id!, projectId: ctx.projectId, status: 200 }, 'Persona deleted');
+      json(res, 200, { deleted: true });
+    },
+  });
+
+  // --- Persona sub-resources: credentials ---
+  resourceRoutes.set(resourceKey('GET', 'personas', true, 'credentials'), {
+    needsDb: true,
+    handler: (req, res, ctx, route, _qs, tenantDb) => {
+      const creds = db.listCredentialsForPersona(tenantDb!, route!.id!);
+      try { auditLog?.record({ action: 'key:access', tenantId: ctx.projectId || 'default', actor: ctx.userEmail || ctx.projectId, resourceType: 'credential', resourceId: route!.id!, ipAddress: req.socket.remoteAddress }); } catch { /* logged inside record() */ }
+      json(res, 200, creds.map(c => ({ ...c, encryptedData: '[REDACTED]', iv: '[REDACTED]', tag: '[REDACTED]' })));
+    },
+  });
+
+  resourceRoutes.set(resourceKey('POST', 'personas', true, 'credentials'), {
+    needsDb: true,
+    handler: async (req, res, ctx, route, _qs, tenantDb, scopedProjectId, reqLogger) => {
+      const persona = withScopedEntity(db.getPersona(tenantDb!, route!.id!), scopedProjectId, res);
+      if (!persona) return;
+      const body = JSON.parse(await readBody(req)) as { credentialId: string };
+      db.linkCredential(tenantDb!, route!.id!, body.credentialId);
+      try { auditLog?.record({ action: 'credential:link', tenantId: ctx.projectId || 'default', actor: ctx.userEmail || ctx.projectId, resourceType: 'persona', resourceId: route!.id!, detail: { credentialId: body.credentialId }, ipAddress: req.socket.remoteAddress }); } catch { /* logged inside record() */ }
+      reqLogger.info({ op: 'persona.linkCredential', resourceType: 'persona', resourceId: route!.id!, credentialId: body.credentialId, projectId: ctx.projectId, status: 200 }, 'Credential linked to persona');
+      json(res, 200, { linked: true });
+    },
+  });
+
+  // --- Persona sub-resources: subscriptions ---
+  resourceRoutes.set(resourceKey('GET', 'personas', true, 'subscriptions'), {
+    needsDb: true,
+    handler: (_req, res, _ctx, route, _qs, tenantDb) => {
+      json(res, 200, db.listSubscriptionsForPersona(tenantDb!, route!.id!));
+    },
+  });
+
+  // --- Tool Definitions ---
+  resourceRoutes.set(resourceKey('POST', 'tool-definitions', false), {
+    needsDb: true,
+    handler: async (req, res, ctx, _route, _qs, tenantDb, _scopedProjectId, reqLogger) => {
+      const body = JSON.parse(await readBody(req)) as Partial<PersonaToolDefinition>;
+      const tool = createToolDefinitionWithDefaults(body);
+      db.upsertToolDefinition(tenantDb!, tool);
+      try { auditLog?.record({ action: 'tool-definition:create', tenantId: ctx.projectId || 'default', actor: ctx.userEmail || ctx.projectId, resourceType: 'toolDefinition', resourceId: tool.id, ipAddress: req.socket.remoteAddress }); } catch { /* logged inside record() */ }
+      reqLogger.info({ op: 'toolDefinition.create', resourceType: 'toolDefinition', resourceId: tool.id, projectId: ctx.projectId, status: 201 }, 'Tool definition created');
+      json(res, 201, tool);
+    },
+  });
+
+  // --- Credentials ---
+  resourceRoutes.set(resourceKey('POST', 'credentials', false), {
+    needsDb: true,
+    handler: async (req, res, ctx, _route, _qs, tenantDb, _scopedProjectId, reqLogger) => {
+      const body = JSON.parse(await readBody(req));
+      if (ctx.authType === 'user') body.projectId = ctx.projectId;
+
+      if (!body.plaintext || typeof body.plaintext !== 'string') {
+        json(res, 400, { error: 'Missing required field: plaintext. Credentials must be submitted as plaintext for server-side encryption.' });
+        return;
+      }
+      if (body.plaintext.length > MAX_PLAINTEXT_CHARS) {
+        json(res, 400, { error: `Plaintext exceeds maximum allowed size of ${MAX_PLAINTEXT_CHARS} characters` });
+        return;
+      }
+      if (!tenantKeyManager) {
+        json(res, 503, { error: 'Credential encryption is unavailable. Server key manager is not configured.' });
+        return;
+      }
+
+      delete body.encryptedData;
+      delete body.iv;
+      delete body.tag;
+
+      const tenantId = body.projectId || ctx.projectId || 'default';
+      const key = await tenantKeyManager.getKey(tenantId);
+      const encrypted = encrypt(body.plaintext, key);
+      body.encryptedData = encrypted.encrypted;
+      body.iv = encrypted.iv;
+      body.tag = encrypted.tag;
+      delete body.plaintext;
+
+      const cred = db.createCredential(tenantDb!, body);
+      try { auditLog?.record({ action: 'key:encrypt', tenantId: body.projectId || ctx.projectId || 'default', actor: ctx.userEmail || ctx.projectId, resourceType: 'credential', resourceId: cred.id, ipAddress: req.socket.remoteAddress }); } catch { /* logged inside record() */ }
+      reqLogger.info({ op: 'credential.create', resourceType: 'credential', resourceId: cred.id, projectId: ctx.projectId, status: 201 }, 'Credential created');
+      json(res, 201, cred);
+    },
+  });
+
+  resourceRoutes.set(resourceKey('DELETE', 'credentials', true), {
+    needsDb: true,
+    handler: (req, res, ctx, route, _qs, tenantDb, scopedProjectId, reqLogger) => {
+      const changes = db.deleteCredential(tenantDb!, route!.id!, scopedProjectId);
+      if (changes === 0) { json(res, 404, { error: 'Not found' }); return; }
+      try { auditLog?.record({ action: 'key:delete', tenantId: ctx.projectId || 'default', actor: ctx.userEmail || ctx.projectId, resourceType: 'credential', resourceId: route!.id!, ipAddress: req.socket.remoteAddress }); } catch { /* logged inside record() */ }
+      reqLogger.info({ op: 'credential.delete', resourceType: 'credential', resourceId: route!.id!, projectId: ctx.projectId, status: 200 }, 'Credential deleted');
+      json(res, 200, { deleted: true });
+    },
+  });
+
+  // --- Event Subscriptions ---
+  resourceRoutes.set(resourceKey('POST', 'subscriptions', false), {
+    needsDb: true,
+    handler: async (req, res, ctx, _route, _qs, tenantDb) => {
+      const body = JSON.parse(await readBody(req));
+      if (ctx.authType === 'user') body.projectId = ctx.projectId;
+      const missing: string[] = [];
+      if (!body.personaId || typeof body.personaId !== 'string') missing.push('personaId');
+      if (!body.eventType || typeof body.eventType !== 'string') missing.push('eventType');
+      if (missing.length > 0) { json(res, 400, { error: `Missing required fields: ${missing.join(', ')}` }); return; }
+      const sub = db.createSubscription(tenantDb!, body);
+      try { auditLog?.record({ action: 'subscription:create', tenantId: ctx.projectId || 'default', actor: ctx.userEmail || ctx.projectId, resourceType: 'subscription', resourceId: sub.id, detail: { personaId: body.personaId, eventType: body.eventType }, ipAddress: req.socket.remoteAddress }); } catch { /* logged inside record() */ }
+      json(res, 201, sub);
+    },
+  });
+
+  resourceRoutes.set(resourceKey('PUT', 'subscriptions', true), {
+    needsDb: true,
+    handler: async (req, res, ctx, route, _qs, tenantDb) => {
+      const body = JSON.parse(await readBody(req));
+      db.updateSubscription(tenantDb!, route!.id!, body);
+      const updated = db.getSubscription(tenantDb!, route!.id!);
+      try { auditLog?.record({ action: 'subscription:update', tenantId: ctx.projectId || 'default', actor: ctx.userEmail || ctx.projectId, resourceType: 'subscription', resourceId: route!.id!, ipAddress: req.socket.remoteAddress }); } catch { /* logged inside record() */ }
+      json(res, 200, updated);
+    },
+  });
+
+  resourceRoutes.set(resourceKey('DELETE', 'subscriptions', true), {
+    needsDb: true,
+    handler: (req, res, ctx, route, _qs, tenantDb) => {
+      db.deleteSubscription(tenantDb!, route!.id!);
+      try { auditLog?.record({ action: 'subscription:delete', tenantId: ctx.projectId || 'default', actor: ctx.userEmail || ctx.projectId, resourceType: 'subscription', resourceId: route!.id!, ipAddress: req.socket.remoteAddress }); } catch { /* logged inside record() */ }
+      json(res, 200, { deleted: true });
+    },
+  });
+
+  // --- Triggers (delegated to triggerHttpHandlers) ---
+  const triggerHandler: RouteHandler = async (req, res, ctx, route, _qs, tenantDb) => {
+    await handleTriggerRoute(route!, req.method!, req, res, tenantDb!, ctx, triggerScheduler);
+  };
+  resourceRoutes.set(resourceKey('POST', 'triggers', false), { needsDb: true, handler: withHttpAudit(triggerHandler, 'trigger:create', 'trigger') });
+  resourceRoutes.set(resourceKey('PUT', 'triggers', true), { needsDb: true, handler: withHttpAudit(triggerHandler, 'trigger:update', 'trigger') });
+  resourceRoutes.set(resourceKey('DELETE', 'triggers', true), { needsDb: true, handler: withHttpAudit(triggerHandler, 'trigger:delete', 'trigger') });
+  resourceRoutes.set(resourceKey('GET', 'triggers', true, 'history'), { needsDb: true, handler: triggerHandler });
+  resourceRoutes.set(resourceKey('GET', 'triggers', true, 'stats'), { needsDb: true, handler: triggerHandler });
+  resourceRoutes.set(resourceKey('GET', 'personas', true, 'triggers'), { needsDb: true, handler: triggerHandler });
+
+  // --- Events ---
+  resourceRoutes.set(resourceKey('GET', 'events', false), {
+    needsDb: true,
+    handler: (_req, res, _ctx, _route, queryString, tenantDb, scopedProjectId) => {
+      const params = new URLSearchParams(queryString || '');
+      const events = db.listEvents(tenantDb!, {
+        eventType: params.get('eventType') ?? undefined,
+        status: (params.get('status') ?? undefined) as import('@dac-cloud/shared').EventStatus | undefined,
+        limit: clampQueryInt(params.get('limit'), 50, MAX_QUERY_LIMIT),
+        offset: clampQueryInt(params.get('offset'), 0, MAX_QUERY_OFFSET),
+        projectId: scopedProjectId,
+      });
+      json(res, 200, events);
+    },
+  });
+
+  resourceRoutes.set(resourceKey('POST', 'events', false), {
+    needsDb: true,
+    handler: withHttpAudit(async (req, res, ctx, _route, _qs, tenantDb) => {
+      const body = JSON.parse(await readBody(req));
+      if (ctx.authType === 'user') body.projectId = ctx.projectId;
+      const missing: string[] = [];
+      if (!body.eventType || typeof body.eventType !== 'string') missing.push('eventType');
+      if (!body.sourceType || typeof body.sourceType !== 'string') missing.push('sourceType');
+      if (missing.length > 0) { json(res, 400, { error: `Missing required fields: ${missing.join(', ')}` }); return; }
+      const event = db.publishEvent(tenantDb!, body);
+      onEventPublished?.();
+      json(res, 201, event);
+    }, 'event:publish', 'event'),
+  });
+
+  resourceRoutes.set(resourceKey('PUT', 'events', true), {
+    needsDb: true,
+    handler: withHttpAudit(async (req, res, _ctx, route, _qs, tenantDb) => {
+      const body = JSON.parse(await readBody(req)) as { status: import('@dac-cloud/shared').EventStatus; metadata?: string };
+      const updated = db.updateEventWithMetadata(tenantDb!, route!.id!, body.status, body.metadata);
+      if (updated) {
+        json(res, 200, updated);
+      } else {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Event not found' }));
+      }
+    }, 'event:update', 'event'),
+  });
+
+  // --- Webhooks ---
+  resourceRoutes.set(resourceKey('POST', 'webhooks', true), {
+    needsDb: true,
+    handler: withHttpAudit(async (req, res, _ctx, route, _qs, tenantDb) => {
+      const personaId = route!.id!;
+      const body = await readBody(req);
+      const event = db.publishEvent(tenantDb!, {
+        eventType: 'webhook_received',
+        sourceType: 'webhook',
+        sourceId: personaId,
+        targetPersonaId: personaId,
+        payload: body,
+      });
+      onEventPublished?.();
+      json(res, 201, event);
+    }, 'webhook:receive', 'webhook'),
+  });
+
+  // --- Executions ---
+  resourceRoutes.set(resourceKey('GET', 'executions', false), {
+    needsDb: true,
+    handler: (_req, res, _ctx, _route, queryString, tenantDb, scopedProjectId) => {
+      const params = new URLSearchParams(queryString || '');
+      const executions = db.listExecutions(tenantDb!, {
+        personaId: params.get('personaId') ?? undefined,
+        status: params.get('status') ?? undefined,
+        limit: clampQueryInt(params.get('limit'), 50, MAX_QUERY_LIMIT),
+        offset: clampQueryInt(params.get('offset'), 0, MAX_QUERY_OFFSET),
+        projectId: scopedProjectId,
+      });
+      json(res, 200, executions);
+    },
+  });
+
+  resourceRoutes.set(resourceKey('POST', 'executions', true, 'cancel'), {
+    handler: (_req, res, _ctx, route) => {
+      handleCancelExecution(res, dispatcher, route!.id!);
+    },
+  });
+
+  resourceRoutes.set(resourceKey('GET', 'executions', true), {
+    handler: (_req, res, _ctx, route, queryString) => {
+      const params = new URLSearchParams(queryString || '');
+      const offset = parseInt(params.get('offset') || '0', 10);
+      handleGetExecution(res, dispatcher, route!.id!, offset);
+    },
+  });
+
+  // ── Request handler ──
   const server = http.createServer(async (req, res) => {
+    // Request correlation ID
+    const reqId = nanoid();
+    const reqLogger = logger.child({ reqId });
+    res.setHeader('X-Request-Id', reqId);
+
+    // Security headers
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+
     // CORS headers
-    res.setHeader('Access-Control-Allow-Origin', '*');
+    const origin = req.headers.origin ?? '';
+    const allowedOrigin = process.env['CORS_ALLOWED_ORIGIN'] || '*';
+    const isAdminRoute = (req.url ?? '').startsWith('/api/admin');
+    if (isAdminRoute) {
+      if (origin && origin === allowedOrigin) {
+        res.setHeader('Access-Control-Allow-Origin', origin);
+      }
+    } else {
+      res.setHeader('Access-Control-Allow-Origin', allowedOrigin);
+    }
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-User-Token');
 
@@ -33,290 +644,90 @@ export function createHttpApi(
 
     const url = req.url || '/';
     const [pathname, queryString] = url.split('?');
+    const route = parseRoute(pathname ?? '');
 
-    // Unauthenticated endpoints
+    // Unauthenticated endpoint
     if (pathname === '/health' && req.method === 'GET') {
-      handleHealth(res, pool, oauth);
+      await handleHealth(res, pool, dispatcher, tokenManager, oauth, getEventProcessorHealth, database, tenantDbManager, kafka, triggerScheduler, auditLog, getRetentionHealth);
       return;
     }
 
-    // Auth check for everything else — dual auth (API key + optional JWT)
+    // Auth check
     const ctx = auth.validateAndExtractContext(req);
     if (!ctx) {
       res.writeHead(401, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Unauthorized' }));
+      res.end(JSON.stringify({ error: 'Unauthorized', reqId }));
       return;
     }
 
-    // Helper: project scoping (admin sees all, user sees own project)
     const scopedProjectId = ctx.authType === 'admin' ? undefined : ctx.projectId;
 
+    const resolveDatabase = (projectId?: string): Database.Database | undefined => {
+      if (tenantDbManager && projectId) {
+        return tenantDbManager.getTenantDb(projectId);
+      }
+      return database;
+    };
+    const tenantDb = resolveDatabase(ctx.projectId);
+
     try {
-      // --- OAuth endpoints ---
-      if (pathname === '/api/oauth/authorize' && req.method === 'POST') {
-        handleOAuthAuthorize(res, oauth);
-      } else if (pathname === '/api/oauth/callback' && req.method === 'POST') {
-        await handleOAuthCallback(req, res, oauth, tokenManager, logger);
-      } else if (pathname === '/api/oauth/status' && req.method === 'GET') {
-        handleOAuthStatus(res, oauth);
-      } else if (pathname === '/api/oauth/refresh' && req.method === 'POST') {
-        await handleOAuthRefresh(res, oauth, tokenManager, logger);
-      } else if (pathname === '/api/oauth/disconnect' && req.method === 'DELETE') {
-        handleOAuthDisconnect(res, oauth, tokenManager);
+      // O(1) exact-path lookup
+      const exactEntry = exactRoutes.get(`${req.method}:${pathname}`);
+      if (exactEntry) {
+        if (exactEntry.adminOnly && requireAdmin(ctx, res)) return;
+        if (exactEntry.needsDb && !tenantDb) { json(res, 404, { error: 'Not found', reqId }); return; }
+        await exactEntry.handler(req, res, ctx, route, queryString, tenantDb, scopedProjectId, reqLogger);
+        return;
       }
-      // --- Token injection (fallback for setup-token / direct paste) ---
-      else if (pathname === '/api/token' && req.method === 'POST') {
-        await handleSetToken(req, res, tokenManager, logger);
-      }
-      // --- Persona CRUD ---
-      else if (pathname === '/api/personas' && req.method === 'GET' && database) {
-        json(res, 200, db.listPersonas(database, scopedProjectId));
-      } else if (pathname === '/api/personas' && req.method === 'POST' && database) {
-        const body = JSON.parse(await readBody(req)) as Partial<Persona>;
-        const now = new Date().toISOString();
-        const persona: Persona = {
-          id: body.id ?? nanoid(),
-          projectId: ctx.authType === 'user' ? ctx.projectId : (body.projectId ?? 'default'),
-          name: body.name ?? 'Untitled',
-          description: body.description ?? null,
-          systemPrompt: body.systemPrompt ?? '',
-          structuredPrompt: body.structuredPrompt ?? null,
-          icon: body.icon ?? null,
-          color: body.color ?? null,
-          enabled: body.enabled ?? true,
-          maxConcurrent: body.maxConcurrent ?? 1,
-          timeoutMs: body.timeoutMs ?? 300_000,
-          modelProfile: body.modelProfile ?? null,
-          maxBudgetUsd: body.maxBudgetUsd ?? null,
-          maxTurns: body.maxTurns ?? null,
-          designContext: body.designContext ?? null,
-          groupId: body.groupId ?? null,
-          createdAt: body.createdAt ?? now,
-          updatedAt: now,
-        };
-        db.upsertPersona(database, persona);
-        json(res, 201, persona);
-      } else if (matchRoute(pathname, '/api/personas/') && req.method === 'GET' && database) {
-        const id = pathname!.replace('/api/personas/', '');
-        const persona = db.getPersona(database, id);
-        if (!persona || (scopedProjectId && persona.projectId !== scopedProjectId)) { json(res, 404, { error: 'Not found' }); return; }
-        json(res, 200, persona);
-      } else if (matchRoute(pathname, '/api/personas/') && pathname!.endsWith('/tools') && req.method === 'GET' && database) {
-        const id = pathname!.replace('/api/personas/', '').replace('/tools', '');
-        json(res, 200, db.getToolsForPersona(database, id));
-      } else if (matchRoute(pathname, '/api/personas/') && pathname!.endsWith('/tools') && req.method === 'POST' && database) {
-        const id = pathname!.replace('/api/personas/', '').replace('/tools', '');
-        const body = JSON.parse(await readBody(req)) as { toolId: string };
-        db.linkTool(database, id, body.toolId);
-        json(res, 200, { linked: true });
-      } else if (matchRoute(pathname, '/api/personas/') && !pathname!.endsWith('/tools') && !pathname!.endsWith('/credentials') && !pathname!.endsWith('/subscriptions') && !pathname!.endsWith('/triggers') && req.method === 'DELETE' && database) {
-        const id = pathname!.replace('/api/personas/', '');
-        db.deletePersona(database, id, scopedProjectId);
-        json(res, 200, { deleted: true });
-      }
-      // --- Tool Definitions ---
-      else if (pathname === '/api/tool-definitions' && req.method === 'POST' && database) {
-        const body = JSON.parse(await readBody(req)) as Partial<PersonaToolDefinition>;
-        const now = new Date().toISOString();
-        const tool: PersonaToolDefinition = {
-          id: body.id ?? nanoid(),
-          name: body.name ?? 'unnamed',
-          category: body.category ?? 'general',
-          description: body.description ?? '',
-          scriptPath: body.scriptPath ?? '',
-          inputSchema: body.inputSchema ?? null,
-          outputSchema: body.outputSchema ?? null,
-          requiresCredentialType: body.requiresCredentialType ?? null,
-          implementationGuide: body.implementationGuide ?? null,
-          isBuiltin: body.isBuiltin ?? false,
-          createdAt: body.createdAt ?? now,
-          updatedAt: now,
-        };
-        db.upsertToolDefinition(database, tool);
-        json(res, 201, tool);
-      }
-      // --- Credentials ---
-      else if (pathname === '/api/credentials' && req.method === 'POST' && database) {
-        const body = JSON.parse(await readBody(req));
-        if (ctx.authType === 'user') body.projectId = ctx.projectId;
-        const cred = db.createCredential(database, body);
-        json(res, 201, cred);
-      } else if (matchRoute(pathname, '/api/credentials/') && req.method === 'DELETE' && database) {
-        const id = pathname!.replace('/api/credentials/', '');
-        db.deleteCredential(database, id);
-        json(res, 200, { deleted: true });
-      } else if (matchRoute(pathname, '/api/personas/') && pathname!.endsWith('/credentials') && req.method === 'GET' && database) {
-        const id = pathname!.replace('/api/personas/', '').replace('/credentials', '');
-        const creds = db.listCredentialsForPersona(database, id);
-        // Strip encrypted data from response
-        json(res, 200, creds.map(c => ({ ...c, encryptedData: '[REDACTED]', iv: '[REDACTED]', tag: '[REDACTED]' })));
-      } else if (matchRoute(pathname, '/api/personas/') && pathname!.endsWith('/credentials') && req.method === 'POST' && database) {
-        const id = pathname!.replace('/api/personas/', '').replace('/credentials', '');
-        const body = JSON.parse(await readBody(req)) as { credentialId: string };
-        db.linkCredential(database, id, body.credentialId);
-        json(res, 200, { linked: true });
-      }
-      // --- Event Subscriptions ---
-      else if (pathname === '/api/subscriptions' && req.method === 'POST' && database) {
-        const body = JSON.parse(await readBody(req));
-        if (ctx.authType === 'user') body.projectId = ctx.projectId;
-        const sub = db.createSubscription(database, body);
-        json(res, 201, sub);
-      } else if (matchRoute(pathname, '/api/subscriptions/') && req.method === 'PUT' && database) {
-        const id = pathname!.replace('/api/subscriptions/', '');
-        const body = JSON.parse(await readBody(req));
-        db.updateSubscription(database, id, body);
-        const updated = db.getSubscription(database, id);
-        json(res, 200, updated);
-      } else if (matchRoute(pathname, '/api/subscriptions/') && req.method === 'DELETE' && database) {
-        const id = pathname!.replace('/api/subscriptions/', '');
-        db.deleteSubscription(database, id);
-        json(res, 200, { deleted: true });
-      } else if (matchRoute(pathname, '/api/personas/') && pathname!.endsWith('/subscriptions') && req.method === 'GET' && database) {
-        const id = pathname!.replace('/api/personas/', '').replace('/subscriptions', '');
-        json(res, 200, db.listSubscriptionsForPersona(database, id));
-      }
-      // --- Triggers ---
-      else if (pathname === '/api/triggers' && req.method === 'POST' && database) {
-        const body = JSON.parse(await readBody(req));
-        if (ctx.authType === 'user') body.projectId = ctx.projectId;
-        const trigger = db.createTrigger(database, body);
-        json(res, 201, trigger);
-      } else if (matchRoute(pathname, '/api/triggers/') && req.method === 'PUT' && database) {
-        const id = pathname!.replace('/api/triggers/', '');
-        const body = JSON.parse(await readBody(req));
-        db.updateTrigger(database, id, body);
-        const updated = db.getTrigger(database, id);
-        json(res, 200, updated);
-      } else if (matchRoute(pathname, '/api/triggers/') && req.method === 'DELETE' && database) {
-        const id = pathname!.replace('/api/triggers/', '');
-        db.deleteTrigger(database, id);
-        json(res, 200, { deleted: true });
-      } else if (matchRoute(pathname, '/api/personas/') && pathname!.endsWith('/triggers') && req.method === 'GET' && database) {
-        const id = pathname!.replace('/api/personas/', '').replace('/triggers', '');
-        json(res, 200, db.listTriggersForPersona(database, id));
-      }
-      // --- Events ---
-      else if (pathname === '/api/events' && req.method === 'GET' && database) {
-        const params = new URLSearchParams(queryString || '');
-        const events = db.listEvents(database, {
-          eventType: params.get('eventType') ?? undefined,
-          status: params.get('status') ?? undefined,
-          limit: params.get('limit') ? parseInt(params.get('limit')!, 10) : 50,
-          offset: params.get('offset') ? parseInt(params.get('offset')!, 10) : undefined,
-          projectId: scopedProjectId,
-        });
-        json(res, 200, events);
-      } else if (pathname === '/api/events' && req.method === 'POST' && database) {
-        const body = JSON.parse(await readBody(req));
-        if (ctx.authType === 'user') body.projectId = ctx.projectId;
-        const event = db.publishEvent(database, body);
-        json(res, 201, event);
-      } else if (matchRoute(pathname, '/api/events/') && req.method === 'PUT' && database) {
-        const id = pathname!.replace('/api/events/', '');
-        const body = JSON.parse(await readBody(req)) as { status: string; metadata?: string };
-        const updated = db.updateEventWithMetadata(database, id, body.status, body.metadata);
-        if (updated) {
-          json(res, 200, updated);
-        } else {
-          res.writeHead(404, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'Event not found' }));
+
+      // O(1) resource-route lookup
+      if (route) {
+        const resKey = resourceKey(req.method!, route.resource, !!route.id, route.subResource);
+        const resEntry = resourceRoutes.get(resKey);
+        if (resEntry) {
+          if (resEntry.adminOnly && requireAdmin(ctx, res)) return;
+          if (resEntry.needsDb && !tenantDb) { json(res, 404, { error: 'Not found', reqId }); return; }
+          await resEntry.handler(req, res, ctx, route, queryString, tenantDb, scopedProjectId, reqLogger);
+          return;
         }
       }
-      // --- Webhooks ---
-      else if (matchRoute(pathname, '/api/webhooks/') && req.method === 'POST' && database) {
-        const personaId = pathname!.replace('/api/webhooks/', '');
-        const body = await readBody(req);
-        const event = db.publishEvent(database, {
-          eventType: 'webhook_received',
-          sourceType: 'webhook',
-          sourceId: personaId,
-          targetPersonaId: personaId,
-          payload: body,
-        });
-        json(res, 201, event);
-      }
-      // --- GitLab Webhook ---
-      else if (pathname === '/api/gitlab/webhook' && req.method === 'POST' && database) {
-        const body = await readBody(req);
-        let parsed: Record<string, unknown> = {};
-        try { parsed = JSON.parse(body); } catch { /* raw payload */ }
-        const objectKind = (parsed['object_kind'] as string) || 'unknown';
-        const projectPath = (parsed['project'] as Record<string, unknown>)?.['path_with_namespace'] as string | undefined;
-        const event = db.publishEvent(database, {
-          eventType: `gitlab_${objectKind}`,
-          sourceType: 'gitlab',
-          sourceId: projectPath ?? null,
-          payload: body,
-        });
-        json(res, 201, event);
-      }
-      // --- Executions ---
-      else if (pathname === '/api/executions' && req.method === 'GET' && database) {
-        const params = new URLSearchParams(queryString || '');
-        const executions = db.listExecutions(database, {
-          personaId: params.get('personaId') ?? undefined,
-          status: params.get('status') ?? undefined,
-          limit: params.get('limit') ? parseInt(params.get('limit')!, 10) : 50,
-          offset: params.get('offset') ? parseInt(params.get('offset')!, 10) : undefined,
-          projectId: scopedProjectId,
-        });
-        json(res, 200, executions);
-      }
-      // --- Existing execution endpoints ---
-      else if (pathname === '/api/status' && req.method === 'GET') {
-        handleStatus(res, pool, dispatcher, tokenManager, oauth);
-      } else if (pathname === '/api/execute' && req.method === 'POST') {
-        await handleExecute(req, res, dispatcher, logger, ctx);
-      } else if (matchRoute(pathname, '/api/executions/') && pathname!.endsWith('/cancel') && req.method === 'POST') {
-        const executionId = pathname!.replace('/api/executions/', '').replace('/cancel', '');
-        handleCancelExecution(res, dispatcher, executionId || '');
-      } else if (matchRoute(pathname, '/api/executions/') && req.method === 'GET') {
-        const executionId = pathname!.replace('/api/executions/', '');
-        const params = new URLSearchParams(queryString || '');
-        const offset = parseInt(params.get('offset') || '0', 10);
-        handleGetExecution(res, dispatcher, executionId, offset);
-      }
-      // --- Admin-only routes ---
-      else if (pathname === '/api/admin/users' && req.method === 'GET' && database) {
-        if (requireAdmin(ctx, res)) return;
-        json(res, 200, { projectIds: db.listDistinctProjectIds(database) });
-      } else if (pathname === '/api/admin/personas' && req.method === 'GET' && database) {
-        if (requireAdmin(ctx, res)) return;
-        json(res, 200, db.listPersonas(database));
-      } else if (pathname === '/api/admin/executions' && req.method === 'GET' && database) {
-        if (requireAdmin(ctx, res)) return;
-        const params = new URLSearchParams(queryString || '');
-        json(res, 200, db.listExecutions(database, {
-          limit: params.get('limit') ? parseInt(params.get('limit')!, 10) : 100,
-          offset: params.get('offset') ? parseInt(params.get('offset')!, 10) : undefined,
-        }));
-      } else {
-        res.writeHead(404, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Not found' }));
-      }
+
+      // No matching route
+      json(res, 404, { error: 'Not found', reqId });
     } catch (err) {
       if (err instanceof Error && err.message === 'Payload too large') {
         res.writeHead(413, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Payload too large' }));
+        res.end(JSON.stringify({ error: 'Payload too large', reqId }));
         return;
       }
-      logger.error({ err, url }, 'HTTP handler error');
+      if (err instanceof Error && err.message.includes('UNIQUE constraint failed')) {
+        res.writeHead(409, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Conflict: a resource with the same unique identifier already exists', reqId }));
+        return;
+      }
+      reqLogger.error({ err, url }, 'HTTP handler error');
       res.writeHead(500, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Internal server error' }));
+      res.end(JSON.stringify({ error: 'Internal server error', reqId }));
     }
   });
 
   return server;
 }
 
-function json(res: http.ServerResponse, status: number, data: unknown): void {
-  res.writeHead(status, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify(data));
-}
-
-function matchRoute(pathname: string | undefined, prefix: string): boolean {
-  return !!pathname && pathname.startsWith(prefix) && pathname.length > prefix.length;
+/**
+ * Checks that an entity exists and belongs to the scoped project (if scoping is active).
+ * Returns the entity on success, or null after sending a 404 response.
+ */
+function withScopedEntity<T extends { projectId?: string | null }>(
+  entity: T | undefined,
+  scopedProjectId: string | undefined,
+  res: http.ServerResponse,
+): T | null {
+  if (!entity || (scopedProjectId && entity.projectId !== scopedProjectId)) {
+    json(res, 404, { error: 'Not found' });
+    return null;
+  }
+  return entity;
 }
 
 /** Returns true (and sends 403) if the caller is NOT an admin. */
@@ -329,156 +740,147 @@ function requireAdmin(ctx: RequestContext, res: http.ServerResponse): boolean {
   return false;
 }
 
-// --- OAuth handlers ---
-
-function handleOAuthAuthorize(res: http.ServerResponse, oauth: OAuthManager): void {
-  const { url, state } = oauth.generateAuthUrl();
-  res.writeHead(200, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({
-    authUrl: url,
-    state,
-    instructions: [
-      '1. Open the authUrl in a browser',
-      '2. Log in with your Anthropic account and authorize',
-      '3. You will be redirected to a page showing an authorization code',
-      '4. Copy the code from the URL (the "code" query parameter)',
-      '5. POST it to /api/oauth/callback with { "code": "...", "state": "..." }',
-    ],
-  }));
-}
-
-async function handleOAuthCallback(
-  req: http.IncomingMessage,
-  res: http.ServerResponse,
-  oauth: OAuthManager,
-  tokenManager: TokenManager,
-  logger: Logger,
-): Promise<void> {
-  const body = await readBody(req);
-  let parsed: { code?: string; state?: string };
-
-  try {
-    parsed = JSON.parse(body);
-  } catch {
-    res.writeHead(400, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'Invalid JSON body' }));
-    return;
-  }
-
-  if (!parsed.code || !parsed.state) {
-    res.writeHead(400, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'Missing required fields: code, state' }));
-    return;
-  }
-
-  const tokens = await oauth.exchangeCode(parsed.code, parsed.state);
-  if (!tokens) {
-    res.writeHead(401, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'OAuth token exchange failed' }));
-    return;
-  }
-
-  // Also store the access token in TokenManager for backward compatibility
-  tokenManager.storeClaudeToken(tokens.accessToken);
-
-  logger.info('OAuth flow completed, subscription connected');
-
-  res.writeHead(200, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({
-    status: 'connected',
-    scopes: tokens.scopes,
-    expiresAt: new Date(tokens.expiresAt).toISOString(),
-  }));
-}
-
-function handleOAuthStatus(res: http.ServerResponse, oauth: OAuthManager): void {
-  const tokens = oauth.getTokens();
-  res.writeHead(200, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({
-    connected: oauth.hasTokens(),
-    scopes: tokens?.scopes || [],
-    expiresAt: tokens ? new Date(tokens.expiresAt).toISOString() : null,
-    isExpired: tokens ? Date.now() > tokens.expiresAt : null,
-  }));
-}
-
-async function handleOAuthRefresh(
-  res: http.ServerResponse,
-  oauth: OAuthManager,
-  tokenManager: TokenManager,
-  logger: Logger,
-): Promise<void> {
-  const tokens = await oauth.refreshAccessToken();
-  if (!tokens) {
-    res.writeHead(500, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'Token refresh failed' }));
-    return;
-  }
-
-  tokenManager.storeClaudeToken(tokens.accessToken);
-  logger.info('OAuth token refreshed via API');
-
-  res.writeHead(200, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({
-    status: 'refreshed',
-    expiresAt: new Date(tokens.expiresAt).toISOString(),
-  }));
-}
-
-function handleOAuthDisconnect(
-  res: http.ServerResponse,
-  oauth: OAuthManager,
-  tokenManager: TokenManager,
-): void {
-  oauth.clearTokens();
-  tokenManager.clearToken();
-  res.writeHead(200, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({ status: 'disconnected' }));
-}
-
-// --- Token injection (for setup-token / manual paste) ---
-
-async function handleSetToken(
-  req: http.IncomingMessage,
-  res: http.ServerResponse,
-  tokenManager: TokenManager,
-  logger: Logger,
-): Promise<void> {
-  const body = await readBody(req);
-  let parsed: { token?: string };
-
-  try {
-    parsed = JSON.parse(body);
-  } catch {
-    res.writeHead(400, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'Invalid JSON body' }));
-    return;
-  }
-
-  if (!parsed.token) {
-    res.writeHead(400, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'Missing required field: token' }));
-    return;
-  }
-
-  tokenManager.storeClaudeToken(parsed.token);
-  logger.info('Claude token set via direct injection');
-
-  res.writeHead(200, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({ status: 'token_stored' }));
-}
-
 // --- Existing handlers ---
 
-function handleHealth(res: http.ServerResponse, pool: WorkerPool, oauth: OAuthManager): void {
+/** Heartbeat age (ms) beyond which a worker is considered stale. */
+const STALE_HEARTBEAT_THRESHOLD_MS = 60_000;
+
+async function handleHealth(
+  res: http.ServerResponse,
+  pool: WorkerPool,
+  dispatcher: Dispatcher,
+  tokenManager: TokenManager,
+  oauth: OAuthManager,
+  getEventProcessorHealth?: () => EventProcessorHealth,
+  database?: Database.Database,
+  tenantDbManager?: TenantDbManager,
+  kafka?: KafkaClient,
+  triggerScheduler?: TriggerSchedulerHandle,
+  auditLog?: AuditLog,
+  getRetentionHealth?: () => RetentionHealth,
+): Promise<void> {
+  const issues: string[] = [];
+
   const counts = pool.getWorkerCount();
-  res.writeHead(200, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({
-    status: 'ok',
-    workers: counts,
-    hasSubscription: oauth.hasTokens(),
+  const workers = pool.getWorkers();
+  const now = Date.now();
+  const staleWorkers = workers
+    .filter(w => (now - w.lastHeartbeat) > STALE_HEARTBEAT_THRESHOLD_MS)
+    .map(w => ({ workerId: w.workerId, heartbeatAgeMs: now - w.lastHeartbeat }));
+
+  if (staleWorkers.length > 0) {
+    issues.push(`${staleWorkers.length} worker(s) with stale heartbeat`);
+  }
+
+  const dbHealth: Record<string, unknown> = { status: 'unavailable' };
+  if (database) {
+    try {
+      database.prepare('SELECT 1').get();
+      dbHealth.status = 'ok';
+    } catch {
+      dbHealth.status = 'error';
+      issues.push('database unreachable');
+    }
+  }
+  if (tenantDbManager) {
+    try {
+      const tenantIds = tenantDbManager.listTenantIds();
+      dbHealth.tenantCount = tenantIds.length;
+      if (dbHealth.status === 'unavailable') dbHealth.status = 'ok';
+    } catch {
+      dbHealth.tenantCount = -1;
+      if (dbHealth.status !== 'error') dbHealth.status = 'error';
+      issues.push('tenant DB listing failed');
+    }
+  }
+
+  let kafkaHealth: Record<string, unknown> = { status: 'disabled' };
+  if (kafka) {
+    const kh = await kafka.checkHealth();
+    kafkaHealth = { status: kh.status, ...(kh.detail ? { detail: kh.detail } : {}) };
+    if (kh.status === 'error') {
+      issues.push(`kafka: ${kh.detail || 'error'}`);
+    }
+  }
+
+  const queueDepth = dispatcher.getQueueLength();
+  const activeExecutions = dispatcher.getActiveExecutions().length;
+
+  let eventProcessorHealth: EventProcessorHealth | undefined;
+  if (getEventProcessorHealth) {
+    eventProcessorHealth = getEventProcessorHealth();
+  }
+
+  const tokenHealth = tokenManager.getHealth();
+  if (tokenHealth.consecutiveDecryptionFailures > 0) {
+    issues.push(`token decryption failures: ${tokenHealth.consecutiveDecryptionFailures} consecutive`);
+  }
+
+  let verdict: 'healthy' | 'degraded' | 'unhealthy';
+  if (issues.some(i => i.includes('database unreachable') || i.includes('kafka: '))) {
+    verdict = 'unhealthy';
+  } else if (issues.length > 0) {
+    verdict = 'degraded';
+  } else {
+    verdict = 'healthy';
+  }
+
+  const body: Record<string, unknown> = {
+    status: verdict,
     timestamp: Date.now(),
-  }));
+    dependencies: {
+      database: dbHealth,
+      kafka: kafkaHealth,
+      workers: {
+        ...counts,
+        staleWorkers: staleWorkers.length > 0 ? staleWorkers : undefined,
+      },
+      token: tokenHealth,
+    },
+    queue: {
+      depth: queueDepth,
+      activeExecutions,
+    },
+    hasSubscription: oauth.hasTokens(),
+    oauthFunnel: oauth.getFunnelMetrics(),
+    oauthErrors: oauth.getErrorMetrics(),
+  };
+
+  if (eventProcessorHealth) {
+    (body.dependencies as Record<string, unknown>).eventProcessor = eventProcessorHealth;
+  }
+
+  if (triggerScheduler) {
+    const schedulerMetrics = triggerScheduler.getMetrics();
+    (body.dependencies as Record<string, unknown>).scheduler = schedulerMetrics;
+    if (schedulerMetrics.triggers_missed_total > 0) {
+      issues.push(`scheduler: ${schedulerMetrics.triggers_missed_total} missed triggers`);
+    }
+  }
+
+  if (auditLog) {
+    const auditHealth = auditLog.getHealth();
+    (body.dependencies as Record<string, unknown>).audit = auditHealth;
+    if (auditHealth.droppedEvents > 0) {
+      issues.push(`audit: ${auditHealth.droppedEvents} dropped events`);
+    }
+  }
+
+  if (getRetentionHealth) {
+    const retHealth = getRetentionHealth();
+    (body.dependencies as Record<string, unknown>).retention = retHealth;
+    if (retHealth.totalErrors > 0) {
+      issues.push(`retention: ${retHealth.totalErrors} total errors`);
+    }
+  }
+
+  if (issues.length > 0) {
+    body.issues = issues;
+  }
+
+  const httpStatus = verdict === 'unhealthy' ? 503 : 200;
+  res.writeHead(httpStatus, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify(body));
 }
 
 function handleStatus(
@@ -493,6 +895,7 @@ function handleStatus(
   res.end(JSON.stringify({
     workers: pool.getWorkers(),
     workerCounts: pool.getWorkerCount(),
+    workerPoolMetrics: pool.getMetrics(),
     queueLength: dispatcher.getQueueLength(),
     activeExecutions: dispatcher.getActiveExecutions(),
     hasClaudeToken: tokenManager.hasToken(),
@@ -538,7 +941,22 @@ async function handleExecute(
     },
   };
 
-  dispatcher.submit(request);
+  const result: SubmitResult = dispatcher.submit(request);
+
+  if (!result.accepted) {
+    logger.warn({ executionId: request.executionId, reason: result.reason }, 'Execution rejected by backpressure');
+    res.writeHead(429, {
+      'Content-Type': 'application/json',
+      'Retry-After': String(result.retryAfterSeconds),
+    });
+    res.end(JSON.stringify({
+      error: result.reason === 'tenant_quota_exceeded'
+        ? 'Per-tenant queue quota exceeded'
+        : 'Queue depth limit exceeded',
+      retryAfterSeconds: result.retryAfterSeconds,
+    }));
+    return;
+  }
 
   logger.info({ executionId: request.executionId }, 'Execution submitted via HTTP');
 
@@ -574,6 +992,7 @@ function handleGetExecution(
     durationMs: exec.durationMs,
     sessionId: exec.sessionId,
     totalCostUsd: exec.totalCostUsd,
+    ...(exec.phaseTimings ? { phaseTimings: exec.phaseTimings } : {}),
   }));
 }
 
@@ -594,22 +1013,14 @@ function handleCancelExecution(
   res.end(JSON.stringify({ executionId, status: 'cancelling' }));
 }
 
-const MAX_BODY_BYTES = 1024 * 1024; // 1 MB
+const MAX_PLAINTEXT_CHARS = 64 * 1024; // 64 KB
+const MAX_QUERY_LIMIT = 500;
+const MAX_QUERY_OFFSET = 100_000;
 
-function readBody(req: http.IncomingMessage): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    let totalBytes = 0;
-    req.on('data', (chunk: Buffer) => {
-      totalBytes += chunk.length;
-      if (totalBytes > MAX_BODY_BYTES) {
-        req.destroy();
-        reject(new Error('Payload too large'));
-        return;
-      }
-      chunks.push(chunk);
-    });
-    req.on('end', () => resolve(Buffer.concat(chunks).toString()));
-    req.on('error', reject);
-  });
+/** Parse an integer query param and clamp it to safe bounds. */
+function clampQueryInt(value: string | null, defaultValue: number, max: number): number {
+  if (!value) return defaultValue;
+  const parsed = parseInt(value, 10);
+  if (!Number.isFinite(parsed) || parsed < 0) return defaultValue;
+  return Math.min(parsed, max);
 }

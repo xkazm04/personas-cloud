@@ -14,13 +14,26 @@ export interface Persona {
   enabled: boolean;
   maxConcurrent: number;
   timeoutMs: number;
-  modelProfile: string | null;
+  inferenceProfileId: string | null;
+  networkPolicy: string | null;
   maxBudgetUsd: number | null;
   maxTurns: number | null;
   designContext: string | null;
   groupId: string | null;
   createdAt: string;
   updatedAt: string;
+}
+
+/** Lightweight projection for list views — omits large text fields. */
+export interface PersonaSummary {
+  id: string;
+  projectId: string;
+  name: string;
+  description: string | null;
+  icon: string | null;
+  color: string | null;
+  enabled: boolean;
+  groupId: string | null;
 }
 
 export interface PersonaToolDefinition {
@@ -48,11 +61,32 @@ export interface StructuredPrompt {
   webSearch?: string;
 }
 
-export interface ModelProfile {
+// ---------------------------------------------------------------------------
+// Inference profiles
+// ---------------------------------------------------------------------------
+
+export type InferenceProvider = 'claude' | 'ollama' | 'litellm' | 'openai-compatible' | 'custom';
+
+export interface InferenceProviderEnvMapping {
+  envVar: string;
+  source: 'baseUrl' | 'authToken' | 'model';
+}
+
+export interface InferenceProfile {
+  id: string;
+  projectId: string;
+  name: string;
+  provider: InferenceProvider;
   model?: string;
-  provider?: string;
   baseUrl?: string;
-  authToken?: string;
+  authTokenEncrypted?: string;
+  authTokenIv?: string;
+  authTokenTag?: string;
+  envMappings: InferenceProviderEnvMapping[];
+  removeEnvKeys?: string[];
+  isPreset: boolean;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface PersonaCredential {
@@ -69,6 +103,43 @@ export interface PersonaCredential {
   updatedAt: string;
 }
 
+// ---------------------------------------------------------------------------
+// Event lifecycle state machine
+// ---------------------------------------------------------------------------
+
+/** All valid event statuses. */
+export type EventStatus = 'pending' | 'processing' | 'delivered' | 'skipped' | 'failed' | 'partial' | 'partial-retry';
+
+/** All valid EventStatus values as a runtime array (for CHECK constraints, etc.). */
+export const EVENT_STATUSES: readonly EventStatus[] = [
+  'pending', 'processing', 'delivered', 'skipped', 'failed', 'partial', 'partial-retry',
+] as const;
+
+/**
+ * Legal state transitions for persona events.
+ * Key = current status, Value = set of statuses it may transition to.
+ */
+export const EVENT_TRANSITIONS: Readonly<Record<EventStatus, ReadonlySet<EventStatus>>> = {
+  'pending':       new Set<EventStatus>(['processing']),
+  'processing':    new Set<EventStatus>(['delivered', 'skipped', 'failed', 'partial', 'partial-retry', 'pending']),
+  'delivered':     new Set<EventStatus>([]),                       // terminal
+  'skipped':       new Set<EventStatus>([]),                       // terminal
+  'failed':        new Set<EventStatus>([]),                       // terminal
+  'partial':       new Set<EventStatus>(['partial-retry']),        // can retry partial failures
+  'partial-retry': new Set<EventStatus>(['processing']),           // retried partial goes back through processing
+};
+
+/**
+ * Validate that a transition from `from` → `to` is legal.
+ * Throws if the transition is invalid.
+ */
+export function validateEventTransition(from: EventStatus, to: EventStatus): void {
+  const allowed = EVENT_TRANSITIONS[from];
+  if (!allowed || !allowed.has(to)) {
+    throw new Error(`Invalid event status transition: '${from}' → '${to}'`);
+  }
+}
+
 export interface PersonaEvent {
   id: string;
   projectId: string;
@@ -77,10 +148,12 @@ export interface PersonaEvent {
   sourceId: string | null;
   targetPersonaId: string | null;
   payload: string | null;
-  status: string;
+  status: EventStatus;
   errorMessage: string | null;
   processedAt: string | null;
   useCaseId: string | null;
+  retryAfter: string | null;
+  retryCount: number;
   createdAt: string;
 }
 
@@ -95,10 +168,56 @@ export interface PersonaEventSubscription {
   updatedAt: string;
 }
 
+// ---------------------------------------------------------------------------
+// Trigger config discriminated union
+// ---------------------------------------------------------------------------
+
+export type TriggerType = 'manual' | 'schedule' | 'polling' | 'webhook' | 'chain';
+
+interface TriggerConfigBase {
+  event_type?: string;
+  payload?: unknown;
+}
+
+export interface ScheduleTriggerConfig extends TriggerConfigBase {
+  kind: 'schedule';
+  cron?: string;
+  interval_seconds?: number;
+}
+
+export interface ManualTriggerConfig extends TriggerConfigBase {
+  kind: 'manual';
+}
+
+export interface PollingTriggerConfig extends TriggerConfigBase {
+  kind: 'polling';
+  poll_url?: string;
+  poll_interval_seconds?: number;
+}
+
+export interface WebhookTriggerConfig extends TriggerConfigBase {
+  kind: 'webhook';
+  url?: string;
+  secret?: string;
+}
+
+export interface ChainTriggerConfig extends TriggerConfigBase {
+  kind: 'chain';
+  source_persona_id?: string;
+  source_event_type?: string;
+}
+
+export type TriggerConfig =
+  | ScheduleTriggerConfig
+  | ManualTriggerConfig
+  | PollingTriggerConfig
+  | WebhookTriggerConfig
+  | ChainTriggerConfig;
+
 export interface PersonaTrigger {
   id: string;
   personaId: string;
-  triggerType: string;
+  triggerType: TriggerType;
   config: string | null;
   enabled: boolean;
   lastTriggeredAt: string | null;
@@ -108,12 +227,45 @@ export interface PersonaTrigger {
   updatedAt: string;
 }
 
+export type TriggerFireStatus = 'fired' | 'completed' | 'failed';
+
+export interface TriggerFire {
+  id: string;
+  triggerId: string;
+  eventId: string | null;
+  executionId: string | null;
+  status: TriggerFireStatus;
+  durationMs: number | null;
+  errorMessage: string | null;
+  firedAt: string;
+}
+
+export interface TriggerStats {
+  totalFires: number;
+  successCount: number;
+  failureCount: number;
+  successRate: number;
+  avgDurationMs: number | null;
+  lastFireStatus: TriggerFireStatus | null;
+  lastFiredAt: string | null;
+}
+
+/** Fully hydrated persona with all related entities. */
+export interface HydratedPersona extends Persona {
+  tools: PersonaToolDefinition[];
+  credentials: Omit<PersonaCredential, 'encryptedData' | 'iv' | 'tag'>[];
+  subscriptions: PersonaEventSubscription[];
+  triggers: PersonaTrigger[];
+}
+
 export interface PersonaExecution {
   id: string;
   projectId?: string;
   personaId: string;
   triggerId: string | null;
   useCaseId: string | null;
+  /** Originating event ID — enables bidirectional event↔execution tracing. */
+  eventId: string | null;
   status: string;
   inputData: string | null;
   outputData: string | null;
@@ -148,6 +300,8 @@ export interface ExecRequest {
   };
   triggerId?: string;
   triggerType?: string;
+  /** Originating event ID — enables bidirectional event↔execution tracing. */
+  eventId?: string;
 }
 
 // Execution result — produced to Kafka by orchestrator
@@ -159,6 +313,7 @@ export interface ExecResult {
   durationMs: number;
   sessionId?: string;
   totalCostUsd?: number;
+  phaseTimings?: import('./protocol.js').PhaseTimings;
   error?: string;
 }
 
@@ -171,6 +326,9 @@ export interface WorkerInfo {
   currentExecutionId?: string;
   connectedAt: number;
   lastHeartbeat: number;
+  imageDigest?: string;
+  claudeCliVersion?: string;
+  verified: boolean;
 }
 
 // Execution output chunk — produced to Kafka for Vibeman SSE consumption
@@ -184,9 +342,17 @@ export interface OutputChunk {
 export interface PersonaCloudEvent {
   executionId: string;
   personaId: string;
-  eventType: 'manual_review' | 'user_message' | 'persona_action' | 'emit_event';
+  eventType: import('./protocolRegistry.js').ProtocolEventType;
   payload: unknown;
   timestamp: number;
+}
+
+// Execution progress (ephemeral — tracked in-memory + Kafka only)
+export interface ProgressInfo {
+  phase: string;
+  percent: number;
+  detail?: string;
+  updatedAt: number;
 }
 
 // Kafka topic names
@@ -194,9 +360,11 @@ export const TOPICS = {
   EXEC_REQUESTS: 'persona.exec.v1',
   EXEC_OUTPUT: 'persona.output.v1',
   EXEC_LIFECYCLE: 'persona.lifecycle.v1',
+  EXEC_PROGRESS: 'persona.progress.v1',
   EVENTS: 'persona.events.v1',
   DLQ: 'persona.dlq.v1',
+  QUEUE_METRICS: 'persona.queue_metrics.v1',
 } as const;
 
 // Protocol version
-export const PROTOCOL_VERSION = '0.1.0';
+export const PROTOCOL_VERSION = '0.2.0';

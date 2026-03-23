@@ -17,11 +17,12 @@ export interface EventMatch {
 /**
  * Match a single event against a list of subscriptions.
  *
+ * Callers are expected to pre-filter subscriptions by eventType (e.g. via
+ * getSubscriptionsByEventType) so no eventType check is performed here.
+ *
  * Rules:
- * 1. subscription.eventType must equal event.eventType
+ * 1. If event.targetPersonaId is set, only that persona's subscriptions match
  * 2. If subscription.sourceFilter is set, event.sourceId must match (exact or wildcard)
- * 3. If event.targetPersonaId is set, only that persona's subscriptions match
- * 4. subscription.enabled must be true
  */
 export function matchEvent(
   event: PersonaEvent,
@@ -29,8 +30,6 @@ export function matchEvent(
 ): EventMatch[] {
   return subscriptions
     .filter((sub) => {
-      if (!sub.enabled) return false;
-      if (sub.eventType !== event.eventType) return false;
       if (event.targetPersonaId && event.targetPersonaId !== sub.personaId) return false;
       if (sub.sourceFilter && !sourceFilterMatches(sub.sourceFilter, event.sourceId)) return false;
       return true;

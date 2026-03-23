@@ -1,6 +1,11 @@
 import { Kafka, type Producer, type Consumer, type EachMessagePayload, logLevel } from 'kafkajs';
-import { TOPICS } from '@dac-cloud/shared';
+import { TOPICS, sealEnvelope, deriveMasterKeyAsync } from '@dac-cloud/shared';
 import type { Logger } from 'pino';
+
+export interface KafkaHealthStatus {
+  status: 'ok' | 'error' | 'disabled';
+  detail?: string;
+}
 
 export interface KafkaClient {
   producer: Producer;
@@ -9,6 +14,11 @@ export interface KafkaClient {
   disconnect(): Promise<void>;
   subscribe(handler: (topic: string, value: string, key?: string) => Promise<void>): Promise<void>;
   produce(topic: string, value: string, key?: string): Promise<void>;
+  /** Produce a message encrypted with per-tenant envelope encryption. */
+  produceEncrypted(topic: string, payload: unknown, tenantId: string, key?: string): Promise<void>;
+  setMasterKey(masterKeyHex: string): Promise<void>;
+  /** Lightweight connectivity probe for health checks. */
+  checkHealth(): Promise<KafkaHealthStatus>;
 }
 
 export function createKafkaClient(
@@ -31,18 +41,33 @@ export function createKafkaClient(
 
   const producer = kafka.producer();
   const consumer = kafka.consumer({ groupId: 'dac-orchestrator' });
+  let masterKey: Buffer | null = null;
+  let connected = false;
+  let lastProduceError: string | null = null;
+
+  // Track produce errors to surface in health checks
+  producer.on('producer.network.request_timeout', () => {
+    lastProduceError = 'request_timeout';
+  });
 
   return {
     producer,
     consumer,
 
+    async setMasterKey(masterKeyHex: string) {
+      masterKey = await deriveMasterKeyAsync(masterKeyHex);
+    },
+
     async connect() {
       await producer.connect();
       await consumer.connect();
+      connected = true;
+      lastProduceError = null;
       logger.info('Kafka connected');
     },
 
     async disconnect() {
+      connected = false;
       await producer.disconnect();
       await consumer.disconnect();
       logger.info('Kafka disconnected');
@@ -77,6 +102,28 @@ export function createKafkaClient(
         }],
       });
     },
+
+    async produceEncrypted(topic: string, payload: unknown, tenantId: string, key?: string) {
+      if (!masterKey) {
+        // Fallback to plaintext if no master key configured
+        await this.produce(topic, JSON.stringify(payload), key);
+        return;
+      }
+      const envelope = sealEnvelope(tenantId, payload, masterKey);
+      await producer.send({
+        topic,
+        messages: [{
+          key: key || undefined,
+          value: JSON.stringify(envelope),
+        }],
+      });
+    },
+
+    async checkHealth(): Promise<KafkaHealthStatus> {
+      if (!connected) return { status: 'error', detail: 'not connected' };
+      if (lastProduceError) return { status: 'error', detail: lastProduceError };
+      return { status: 'ok' };
+    },
   };
 }
 
@@ -87,11 +134,18 @@ export function createNoopKafkaClient(logger: Logger): KafkaClient {
   return {
     producer: {} as Producer,
     consumer: {} as Consumer,
+    async setMasterKey() {},
     async connect() {},
     async disconnect() {},
     async subscribe() {},
     async produce(topic: string, value: string) {
       logger.debug({ topic, valueLength: value.length }, 'No-op Kafka produce');
+    },
+    async produceEncrypted(topic: string, payload: unknown) {
+      logger.debug({ topic }, 'No-op Kafka produceEncrypted');
+    },
+    async checkHealth(): Promise<KafkaHealthStatus> {
+      return { status: 'disabled' };
     },
   };
 }
