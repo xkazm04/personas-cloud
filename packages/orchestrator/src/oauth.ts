@@ -118,6 +118,8 @@ export interface OAuthFunnelMetrics {
   flowsFailed: number;
 }
 
+const MAX_PENDING_STATES = 50;
+
 /** Per-error-type counters for OAuth token endpoint failures. */
 export interface OAuthErrorMetrics {
   invalid_grant: number;
@@ -270,11 +272,24 @@ export class OAuthManager {
       .update(codeVerifier)
       .digest('base64url');
 
+    // Prune expired entries to prevent unbounded growth
+    const now = Date.now();
+    for (const [key, entry] of this.pendingStates) {
+      if (now > entry.expiresAt) this.pendingStates.delete(key);
+    }
+
+    // Cap total pending states to prevent memory DoS via rapid authorize calls
+    if (this.pendingStates.size >= MAX_PENDING_STATES) {
+      // Evict the oldest entry to make room
+      const oldest = this.pendingStates.keys().next().value!;
+      this.pendingStates.delete(oldest);
+    }
+
     const oauthState: OAuthState = {
       state,
       codeVerifier,
-      createdAt: Date.now(),
-      expiresAt: Date.now() + 10 * 60 * 1000, // 10 minutes
+      createdAt: now,
+      expiresAt: now + 10 * 60 * 1000, // 10 minutes
     };
 
     this.pendingStates.set(state, oauthState);
@@ -317,6 +332,9 @@ export class OAuthManager {
       return { ok: false, error: { errorType: 'invalid_request', message: 'OAuth state expired', transient: false } };
     }
 
+    // Consume the state so it cannot be replayed
+    this.pendingStates.delete(state);
+
     const cleanedCode = authorizationCode.split('#')[0]?.split('&')[0] ?? authorizationCode;
 
     const result = await this.postTokenEndpoint(
@@ -331,8 +349,6 @@ export class OAuthManager {
       OAuthManager.DEFAULT_SCOPES,
       'token exchange',
     );
-
-    this.pendingStates.delete(state);
 
     if (result.ok) {
       this.flowsCompleted++;
@@ -401,6 +417,14 @@ export class OAuthManager {
 
   /**
    * Get a valid access token, refreshing if necessary.
+   *
+   * Uses a pending-promise mutex so concurrent callers share a single
+   * in-flight refresh instead of racing against each other.  This is
+   * critical because OAuth refresh tokens are single-use rotation tokens:
+   * if two callers both call refreshAccessToken() concurrently, the second
+   * one sends an already-invalidated refresh token, causing a 401 and
+   * permanently breaking the token chain.
+   *
    * Returns null if no tokens available or refresh fails.
    */
   async getValidAccessToken(): Promise<string | null> {

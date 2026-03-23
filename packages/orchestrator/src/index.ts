@@ -17,7 +17,7 @@ import { startRetentionJob } from './retention.js';
 import { startEventProcessor } from './eventProcessor.js';
 import { startTriggerScheduler } from './triggerScheduler.js';
 import { loadTlsConfig } from './tls.js';
-import { TOPICS, type ExecRequest } from '@dac-cloud/shared';
+import { TOPICS, projectTopic, type ExecRequest } from '@dac-cloud/shared';
 
 const logger = pino({ level: process.env['LOG_LEVEL'] || 'info' });
 
@@ -34,7 +34,11 @@ async function main() {
   }, 'Configuration loaded');
 
   // Initialize components
-  const auth = createAuth(config.teamApiKey, config.supabaseJwtSecret || undefined);
+  const auth = createAuth(config.teamApiKey, {
+    supabaseJwtSecret: config.supabaseJwtSecret || undefined,
+    supabaseProjectRef: config.supabaseProjectRef || undefined,
+    enableAdminFallback: config.enableAdminFallback,
+  });
   const tokenManager = await createTokenManager(config.masterKey, logger);
   const oauth = new OAuthManager(logger);
 
@@ -56,9 +60,18 @@ async function main() {
     rejectUnverified: config.rejectUnverifiedWorkers,
   });
 
-  // Kafka client
+  // Kafka client (deployment ID isolates consumer groups in multi-deployment setups)
   const kafka = config.kafkaEnabled
-    ? createKafkaClient(config.kafkaBrokers, config.kafkaUsername, config.kafkaPassword, logger)
+    ? createKafkaClient(
+        config.kafkaBrokers,
+        config.kafkaUsername,
+        config.kafkaPassword,
+        config.kafkaSigningKey,
+        logger,
+        config.kafkaDeploymentId || undefined,
+        config.kafkaBatchSize,
+        config.kafkaLingerMs,
+      )
     : createNoopKafkaClient(logger);
 
   // Audit log (separate append-only DB)
@@ -108,28 +121,38 @@ async function main() {
   dispatcher.setTenantKeyManager(tenantKeyManager);
   dispatcher.setAuditLog(auditLog);
 
+  // Recover queued executions from DB (crash recovery)
+  dispatcher.recoverQueue();
+
   // Connect Kafka
   if (config.kafkaEnabled) {
     await kafka.connect();
 
-    // Subscribe to execution requests
+    // Subscribe to execution requests (base topic handles requests without projectId)
     await kafka.subscribe(async (topic: string, value: string) => {
-      if (topic === TOPICS.EXEC_REQUESTS) {
-        try {
-          const request: ExecRequest = JSON.parse(value);
-          const result = dispatcher.submit(request);
-          if (!result.accepted) {
-            logger.warn({ executionId: request.executionId, reason: result.reason }, 'Kafka execution rejected by backpressure, sending to DLQ');
-            await kafka.produce(TOPICS.DLQ, JSON.stringify({
-              originalTopic: TOPICS.EXEC_REQUESTS,
-              reason: result.reason,
-              payload: request,
-              timestamp: Date.now(),
-            }), request.executionId);
-          }
-        } catch (err) {
-          logger.error({ err }, 'Failed to parse execution request from Kafka');
+      try {
+        const request: ExecRequest = JSON.parse(value);
+
+        // Validate that the message's projectId matches the topic it was sent to.
+        const expectedTopic = projectTopic(TOPICS.EXEC_REQUESTS, request.projectId);
+        if (topic !== expectedTopic) {
+          logger.warn({ topic, expectedTopic, projectId: request.projectId, executionId: request.executionId },
+            'ExecRequest projectId does not match topic — dropped');
+          return;
         }
+
+        const result = dispatcher.submit(request);
+        if (!result.accepted) {
+          logger.warn({ executionId: request.executionId, reason: result.reason }, 'Kafka execution rejected by backpressure, sending to DLQ');
+          await kafka.produce(TOPICS.DLQ, JSON.stringify({
+            originalTopic: TOPICS.EXEC_REQUESTS,
+            reason: result.reason,
+            payload: request,
+            timestamp: Date.now(),
+          }), request.executionId);
+        }
+      } catch (err) {
+        logger.error({ err }, 'Failed to parse execution request from Kafka');
       }
     });
   }
@@ -138,7 +161,6 @@ async function main() {
   const tlsConfig = loadTlsConfig(logger);
   pool.listen(config.wsPort, tlsConfig.enabled ? tlsConfig : undefined);
 
-  // Start HTTP API (now includes OAuth endpoints + persona CRUD)
   // Set master key on Kafka for envelope encryption
   await kafka.setMasterKey(config.masterKey);
 
@@ -230,10 +252,10 @@ async function main() {
     clearInterval(eventProcessor.timer);
     triggerScheduler.close();
     clearInterval(retentionJob.timer);
+    httpServer.close(); // Stop accepting new HTTP connections first
     dispatcher.shutdown();
     pool.shutdown();
     await kafka.disconnect();
-    httpServer.close();
     tenantKeyManager.close();
     auditChainVerifier.close();
     auditRetention.close();

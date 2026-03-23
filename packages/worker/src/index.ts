@@ -1,7 +1,9 @@
 import pino from 'pino';
 import { loadConfig } from './config.js';
 import { Connection, type WorkerTlsConfig } from './connection.js';
-import { Executor } from './executor.js';
+import { resolveClaudeCommand } from './executor.js';
+import { ExecutionManager } from './execution-manager.js';
+import { MetricsCollector } from './metrics.js';
 import { installCredentialExitHandler, sweepOrphanedCredentialFiles } from './credentialInjector.js';
 import { startHealthProbe } from './healthProbe.js';
 import type { ExecAssign } from '@dac-cloud/shared';
@@ -12,14 +14,26 @@ async function main() {
   logger.info('Starting DAC Cloud Worker...');
 
   const config = loadConfig();
-  logger.info({ workerId: config.workerId, orchestratorUrl: config.orchestratorUrl }, 'Configuration loaded');
+  logger.info({
+    workerId: config.workerId,
+    orchestratorUrl: config.orchestratorUrl,
+    maxConcurrentExecutions: config.maxConcurrentExecutions,
+  }, 'Configuration loaded');
 
   // Clean up any credential files left behind by a previous crash
   installCredentialExitHandler(logger);
   await sweepOrphanedCredentialFiles(logger);
 
-  const executor = new Executor(logger);
-  let currentExecutionId: string | null = null;
+  // Resolve the Claude CLI command once at startup to avoid a blocking
+  // execSync call on every execution.
+  const claudeCommand = resolveClaudeCommand();
+  logger.info({ command: claudeCommand.command, shell: claudeCommand.shell }, 'Resolved Claude CLI at startup');
+
+  // Unified execution lifecycle manager
+  const executionManager = new ExecutionManager(logger, config.maxConcurrentExecutions, claudeCommand);
+
+  // System health metrics collector
+  const metrics = new MetricsCollector();
 
   const connection = new Connection(
     config.orchestratorUrl,
@@ -27,79 +41,87 @@ async function main() {
     config.workerToken,
     {
       onAssign(msg: ExecAssign) {
-        if (currentExecutionId || executor.isBusy()) {
-          logger.warn(
-            { executionId: msg.executionId, currentExecutionId },
-            'Received assignment while busy, sending busy nack',
-          );
-          connection.sendBusy(msg.executionId, 'Worker is already executing');
+        if (executionManager.availableSlots() <= 0) {
+          logger.warn({ executionId: msg.executionId }, 'Received assignment but no slots available — rejecting');
+          connection.sendComplete(msg.executionId, 'failed', 1, 0);
           return;
         }
 
-        currentExecutionId = msg.executionId;
+        // Create a dedicated Executor instance for this execution
+        const executor = executionManager.createExecutor(msg.executionId);
+
+        // Guard against sending duplicate complete messages to the orchestrator.
+        // If onComplete succeeds, the catch handler must not send a second complete.
+        let completed = false;
 
         executor.execute(msg, {
-          onStdout(chunk: string, timestamp: number) {
-            connection.sendStdout(msg.executionId, chunk);
-          },
-
-          onStderr(chunk: string, timestamp: number) {
-            logger.warn({ executionId: msg.executionId, stderr: chunk }, 'CLI stderr');
-            connection.sendStderr(msg.executionId, chunk);
-          },
-
-          onEvent(eventType, payload) {
-            connection.sendEvent(msg.executionId, eventType, payload);
-          },
-
-          onProgress(phase: string, percent: number, detail?: string) {
-            connection.sendProgress(msg.executionId, phase, percent, detail);
-          },
-
-          onComplete(status, exitCode, durationMs, sessionId, totalCostUsd, phaseTimings) {
-            connection.sendComplete(msg.executionId, status, exitCode, durationMs, sessionId, totalCostUsd, phaseTimings);
-            currentExecutionId = null;
-
-            // Signal ready for next assignment
-            connection.sendReady();
+          onMessage(emsg) {
+            switch (emsg.type) {
+              case 'stdout':
+                connection.sendStdout(msg.executionId, emsg.chunk);
+                break;
+              case 'stderr':
+                logger.warn({ executionId: msg.executionId, stderr: emsg.chunk }, 'CLI stderr');
+                connection.sendStderr(msg.executionId, emsg.chunk);
+                break;
+              case 'event':
+                connection.sendEvent(msg.executionId, emsg.eventType, emsg.payload);
+                break;
+              case 'progress':
+                connection.sendProgress(msg.executionId, emsg.progress);
+                break;
+              case 'flush_output':
+                connection.flushOutput(msg.executionId);
+                break;
+              case 'review_request':
+                connection.sendReviewRequest(msg.executionId, emsg.reviewId, emsg.payload);
+                break;
+              case 'complete':
+                completed = true;
+                connection.sendComplete(msg.executionId, emsg.status, emsg.exitCode, emsg.durationMs, emsg.sessionId, emsg.totalCostUsd);
+                metrics.recordExecution(emsg.durationMs);
+                executionManager.removeExecution(msg.executionId);
+                connection.sendReady(executionManager.availableSlots(), config.maxConcurrentExecutions);
+                break;
+            }
           },
         }).catch((err) => {
           logger.error({ err, executionId: msg.executionId }, 'Execution error');
-          connection.sendComplete(msg.executionId, 'failed', 1, 0);
-          currentExecutionId = null;
-          connection.sendReady();
+          if (!completed) {
+            connection.sendComplete(msg.executionId, 'failed', 1, 0);
+            executionManager.removeExecution(msg.executionId);
+            connection.sendReady(executionManager.availableSlots(), config.maxConcurrentExecutions);
+          }
         });
       },
 
       onCancel(msg) {
-        if (currentExecutionId === msg.executionId) {
+        const executor = executionManager.getExecutor(msg.executionId);
+        if (executor) {
           logger.info({ executionId: msg.executionId }, 'Cancelling execution');
           executor.kill();
         }
       },
 
+      onReviewResponse(msg) {
+        const executor = executionManager.getExecutor(msg.executionId);
+        if (executor) {
+          const resolved = executor.resolveReview(msg.reviewId, msg.message);
+          if (!resolved) {
+            logger.warn({ executionId: msg.executionId, reviewId: msg.reviewId }, 'Review response for unknown review ID');
+          }
+        } else {
+          logger.warn({ executionId: msg.executionId }, 'Review response for unknown execution');
+        }
+      },
+
       onShutdown(msg) {
         logger.info({ reason: msg.reason, gracePeriodMs: msg.gracePeriodMs }, 'Shutdown requested');
+        executionManager.drain(msg.gracePeriodMs).then(shutdown);
+      },
 
-        if (currentExecutionId) {
-          // Wait for current execution to finish, then exit
-          logger.info('Waiting for current execution to complete before shutdown');
-          const checkInterval = setInterval(() => {
-            if (!currentExecutionId) {
-              clearInterval(checkInterval);
-              shutdown();
-            }
-          }, 1000);
-
-          // Force shutdown after grace period
-          setTimeout(() => {
-            clearInterval(checkInterval);
-            executor.kill();
-            shutdown();
-          }, msg.gracePeriodMs);
-        } else {
-          shutdown();
-        }
+      getActiveExecutionIds() {
+        return executionManager.getActiveExecutionIds();
       },
     },
     logger,
@@ -111,7 +133,11 @@ async function main() {
       rejectUnauthorized: config.tlsRejectUnauthorized,
     } as WorkerTlsConfig : undefined,
     { imageDigest: config.imageDigest, claudeCliVersion: config.claudeCliVersion },
+    config.maxConcurrentExecutions,
   );
+
+  // Wire health metrics into heartbeats
+  connection.setHealthMetricsProvider(() => metrics.collect());
 
   // Connect to orchestrator
   connection.connect();
@@ -122,7 +148,7 @@ async function main() {
     healthServer = startHealthProbe(
       config.healthPort,
       connection,
-      executor,
+      executionManager,
       config.workerId,
       logger,
     );
@@ -136,23 +162,24 @@ async function main() {
     logger.info('Shutting down worker...');
     healthServer?.close();
     connection.disconnect();
-
-    // Drain the executor's finally-block cleanup (sandbox dirs, credential
-    // files, proxy) before calling process.exit so nothing is leaked.
-    await executor.waitForCleanup();
     process.exit(0);
   }
 
-  const onTermSignal = () => {
-    if (currentExecutionId) {
-      logger.info('Termination signal received, killing current execution');
-      executor.kill();
-    }
+  // SIGINT: immediate kill (interactive terminal interrupt)
+  process.on('SIGINT', () => {
+    logger.info({ activeCount: executionManager.activeCount() }, 'SIGINT received');
+    executionManager.killAll();
     shutdown();
-  };
+  });
 
-  process.on('SIGINT', onTermSignal);
-  process.on('SIGTERM', onTermSignal);
+  // SIGTERM: graceful drain with configurable grace period
+  process.on('SIGTERM', () => {
+    logger.info(
+      { activeCount: executionManager.activeCount(), gracePeriodMs: config.shutdownGracePeriodMs },
+      'SIGTERM received',
+    );
+    executionManager.drain(config.shutdownGracePeriodMs).then(shutdown);
+  });
 
   logger.info('DAC Cloud Worker started');
 }
