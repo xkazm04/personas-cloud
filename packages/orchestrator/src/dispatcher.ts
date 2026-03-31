@@ -1,13 +1,13 @@
-import { type ExecAssign, type ExecRequest, type ExecStdout, type ExecStderr, type ExecComplete, type ExecProgress, type WorkerEvent, type WorkerBusy, type WorkerReviewRequest, type PermissionPolicy, type ReviewRequest, type WorkerInfo, type ProgressInfo, type PhaseTimings, type EncryptedPayload, TOPICS, projectTopic, assemblePrompt, parseModelProfile, parsePermissionPolicy, decrypt, DecryptionError, deriveMasterKeyAsync } from '@dac-cloud/shared';
+import { type ExecAssign, type ExecRequest, type ExecStdout, type ExecStderr, type ExecComplete, type ExecProgress, type WorkerBusy, type WorkerReviewRequest, type PermissionPolicy, type ReviewRequest, type WorkerInfo, type PhaseTimings, type EncryptedPayload, assemblePrompt, parseModelProfile, parsePermissionPolicy, decrypt, DecryptionError, deriveMasterKeyAsync } from '@dac-cloud/shared';
 import { OrchestratorMetrics } from './metrics.js';
 import type Database from 'better-sqlite3';
 import type { WorkerPool } from './workerPool.js';
 import type { TokenManager } from './tokenManager.js';
 import type { OAuthManager } from './oauth.js';
-import type { KafkaClient } from './kafka.js';
 import type { TenantDbManager } from './tenantDbManager.js';
 import type { TenantKeyManager } from './tenantKeyManager.js';
 import type { AuditLog } from './auditLog.js';
+import type { MachinePool } from './machinePool.js';
 import type { Logger } from 'pino';
 import * as db from './db/index.js';
 import { resolveToken, ExecutionPreparer, type Decryptor } from './dispatchPipeline.js';
@@ -24,7 +24,7 @@ interface QueuedExecution {
 /**
  * Rolling tail buffer size per execution (64 KB).
  * Only the most recent output is kept in memory for real-time polling.
- * Full output is persisted to DB and streamed to Kafka.
+ * Full output is persisted to DB.
  */
 const TAIL_BUFFER_BYTES = 64 * 1024;
 
@@ -72,6 +72,19 @@ class RingBuffer<T> {
     this.buf[this.tail] = item;
     this.tail = (this.tail + 1) % this.buf.length;
     this.count++;
+  }
+
+  /** Insert at the front of the buffer (high-priority re-queue). O(1) amortized. */
+  unshift(item: T): void {
+    if (this.count === this.buf.length) this.grow();
+    this.head = (this.head - 1 + this.buf.length) % this.buf.length;
+    this.buf[this.head] = item;
+    this.count++;
+  }
+
+  peek(): T | undefined {
+    if (this.count === 0) return undefined;
+    return this.buf[this.head]!;
   }
 
   shift(): T | undefined {
@@ -192,9 +205,24 @@ class ExecutionQueue {
     this.ready.push(item);
   }
 
+  /** Push an item to the back of the ready queue. Alias for pushReady. O(1) amortized. */
+  push(item: QueuedExecution): void {
+    this.ready.push(item);
+  }
+
+  /** Push an item to the front of the ready queue (high-priority re-queue). O(1) amortized. */
+  unshift(item: QueuedExecution): void {
+    this.ready.unshift(item);
+  }
+
   /** Push a backoff item into the min-heap. O(log n). */
   pushBackoff(item: QueuedExecution): void {
     this.backoff.push(item);
+  }
+
+  /** Peek at the first ready item without removing it. O(1). */
+  peek(): QueuedExecution | undefined {
+    return this.ready.peek();
   }
 
   /** Dequeue the first ready item. O(1). */
@@ -288,7 +316,7 @@ interface ActiveExecution {
   startedAt: number;
   /**
    * Rolling tail buffer — only the most recent ~64 KB of output lines.
-   * Full output is persisted to DB and streamed to Kafka.
+   * Full output is persisted to DB.
    */
   output: string[];
   /** Running total of bytes in the tail buffer. */
@@ -296,7 +324,6 @@ interface ActiveExecution {
   /** Total number of output lines received (including evicted lines). */
   totalOutputLines: number;
   status: 'running' | 'completed' | 'failed' | 'cancelled';
-  progress?: ProgressInfo;
   completedAt?: number;
   exitCode?: number;
   durationMs?: number;
@@ -321,31 +348,6 @@ interface ActiveExecution {
 }
 
 const OUTPUT_FLUSH_INTERVAL_MS = 500;
-
-export class Dispatcher {
-  private queue: QueuedExecution[] = [];
-  // In-memory map for real-time output + cancel routing (active executions only)
-  private active = new Map<string, ActiveExecution>();
-  private tenantDbManager: TenantDbManager | null = null;
-  private masterKey: Buffer | null = null;
-  private tenantKeyManager: TenantKeyManager | null = null;
-  private auditLog: AuditLog | null = null;
-  private preparer: ExecutionPreparer | null = null;
-  // Maps executionId → projectId for DB resolution during callbacks
-  private executionTenant = new Map<string, string>();
-  // Batched output buffers: executionId → pending chunks
-  private outputBuffers = new Map<string, string[]>();
-  private outputFlushTimer: NodeJS.Timeout;
-  // Guard flag to prevent concurrent processQueue runs from racing on getIdleWorker/assign
-  private dispatching = false;
-  // Backpressure state
-  private backpressure: QueueBackpressureConfig;
-  private tenantQueueCounts = new Map<string, number>();
-  private currentThresholdLevel: ThresholdLevel = 'normal';
-  // Interval counters — reset each time snapshotAndResetCounters() is called
-  private _intervalCompleted = 0;
-  private _intervalFailed = 0;
-  private _intervalCostUsd = 0;
 
 /**
  * Lightweight cache entry for recently-completed executions.
@@ -387,6 +389,7 @@ interface ExecutionSnapshotBase {
   durationMs?: number;
   sessionId?: string;
   totalCostUsd?: number;
+  phaseTimings?: PhaseTimings;
 }
 
 export interface LiveExecutionSnapshot extends ExecutionSnapshotBase {
@@ -485,13 +488,13 @@ interface LifecyclePayload {
 }
 
 /**
- * Abstraction over the triple-write pattern (DB + Kafka + Metrics).
+ * Abstraction over the dual-write pattern (DB + Metrics).
  * Each method represents a single concern; CompositeSink fans out calls
  * to all registered sinks with independent error isolation.
  */
 export interface ExecutionSink {
   /** Persist an output chunk (stdout or stderr line). */
-  onOutput(executionId: string, dbLine: string, projectId: string | undefined, kafkaPayload: { executionId: string; chunk: string; timestamp: number }): void;
+  onOutput(executionId: string, dbLine: string, projectId: string | undefined): void;
   /** Record a terminal lifecycle event (completion, failure, disconnect). */
   onLifecycle(projectId: string | undefined, payload: LifecyclePayload): void;
   /** Persist execution completion to DB (status, duration, cost, session). */
@@ -521,7 +524,7 @@ class DbSink implements ExecutionSink {
   }
 
   onLifecycle(): void {
-    // Lifecycle events are Kafka-only; DB persistence is handled by onComplete/onFailed
+    // Lifecycle events are informational only; DB persistence is handled by onComplete/onFailed
   }
 
   onComplete(executionId: string, status: DbExecutionStatus, msg: { durationMs: number; sessionId?: string; totalCostUsd?: number }): void {
@@ -536,27 +539,22 @@ class DbSink implements ExecutionSink {
         costUsd: msg.totalCostUsd ?? 0,
       });
       // Resolve trigger firing outcome if this execution was trigger-sourced
-      if (status === 'completed' || status === 'failed') {
-        try {
-          db.resolveTriggerFiring(database, executionId, {
-            status: status as 'completed' | 'failed',
-            costUsd: msg.totalCostUsd,
-            durationMs: msg.durationMs,
-          });
-        } catch { /* best effort — firing may not exist for non-trigger executions */ }
-      }
+      // TODO: implement resolveTriggerFiring in db module (maps executionId → trigger_fire row)
+      // if (status === 'completed' || status === 'failed') {
+      //   try { db.resolveTriggerFiring(database, executionId, { status, costUsd: msg.totalCostUsd, durationMs: msg.durationMs }); }
+      //   catch { /* best effort */ }
+      // }
       // Track cost against deployment budget (if this persona has a deployment)
-      if (msg.totalCostUsd && msg.totalCostUsd > 0) {
-        try {
-          const exec = db.getExecution(database, executionId);
-          if (exec) {
-            const deployment = db.getDeploymentByPersona(database, exec.personaId);
-            if (deployment) {
-              db.addDeploymentCost(database, deployment.id, msg.totalCostUsd);
-            }
-          }
-        } catch { /* best effort — budget tracking is non-critical */ }
-      }
+      // TODO: implement getDeploymentByPersona / addDeploymentCost in db module
+      // if (msg.totalCostUsd && msg.totalCostUsd > 0) {
+      //   try {
+      //     const exec = db.getExecution(database, executionId);
+      //     if (exec) {
+      //       const deployment = db.getDeploymentByPersona(database, exec.personaId);
+      //       if (deployment) { db.addDeploymentCost(database, deployment.id, msg.totalCostUsd); }
+      //     }
+      //   } catch { /* best effort */ }
+      // }
     } catch (err) {
       this.logger.error({ err, executionId }, 'Failed to persist execution completion');
     }
@@ -571,10 +569,8 @@ class DbSink implements ExecutionSink {
         errorMessage,
         completedAt: new Date().toISOString(),
       });
-      db.resolveTriggerFiring(database, executionId, {
-        status: 'failed',
-        errorMessage,
-      });
+      // TODO: implement resolveTriggerFiring in db module
+      // db.resolveTriggerFiring(database, executionId, { status: 'failed', errorMessage });
     } catch { /* best effort */ }
   }
 
@@ -592,43 +588,6 @@ class DbSink implements ExecutionSink {
         completedAt: null,
       });
     } catch { /* best effort */ }
-  }
-}
-
-class KafkaSink implements ExecutionSink {
-  constructor(
-    private kafka: KafkaClient,
-    private logger: Logger,
-  ) {}
-
-  onOutput(_executionId: string, _dbLine: string, projectId: string | undefined, kafkaPayload: { executionId: string; chunk: string; timestamp: number }): void {
-    const outputTopic = projectTopic(TOPICS.EXEC_OUTPUT, projectId);
-    this.kafka.produce(outputTopic, JSON.stringify(kafkaPayload), kafkaPayload.executionId).catch(err => {
-      this.logger.error({ err, executionId: kafkaPayload.executionId }, 'Failed to produce output to Kafka');
-    });
-  }
-
-  onLifecycle(projectId: string | undefined, payload: LifecyclePayload): void {
-    const topic = projectTopic(TOPICS.EXEC_LIFECYCLE, projectId);
-    this.kafka.produce(topic, JSON.stringify(payload), payload.executionId).catch(err => {
-      this.logger.error({ err, executionId: payload.executionId }, 'Failed to produce lifecycle to Kafka');
-    });
-  }
-
-  onComplete(): void {
-    // DB-only operation
-  }
-
-  onFailed(): void {
-    // DB-only operation
-  }
-
-  onMetrics(): void {
-    // Handled by MetricsSink
-  }
-
-  onReclaimed(): void {
-    // DB-only operation
   }
 }
 
@@ -659,13 +618,12 @@ class CompositeSink implements ExecutionSink {
     private metrics: OrchestratorMetrics,
   ) {}
 
-  onOutput(executionId: string, dbLine: string, projectId: string | undefined, kafkaPayload: { executionId: string; chunk: string; timestamp: number }): void {
-    // Fan out to all sinks — DB is sync (wrapped in try/catch inside DbSink),
-    // Kafka is async (fire-and-forget with .catch inside KafkaSink).
+  onOutput(executionId: string, dbLine: string, projectId: string | undefined): void {
+    // Fan out to all sinks — DB is sync (wrapped in try/catch inside DbSink).
     // Track per-sink error metrics for observability.
     for (const sink of this.sinks) {
       try {
-        sink.onOutput(executionId, dbLine, projectId, kafkaPayload);
+        sink.onOutput(executionId, dbLine, projectId);
       } catch {
         this.metrics.recordOutputDbError();
       }
@@ -738,10 +696,10 @@ export class PersonaResolver {
    * Returns the resolved config, or `{ error }` if the persona can't be resolved
    * (e.g. persona deleted). The caller decides how to surface the failure.
    */
-  resolve(
+  async resolve(
     request: ExecRequest,
     claudeToken: string,
-  ): ResolvedPersona | { error: string } {
+  ): Promise<ResolvedPersona | { error: string }> {
     const env: Record<string, string> = {
       ANTHROPIC_API_KEY: claudeToken,
     };
@@ -773,7 +731,7 @@ export class PersonaResolver {
       if (masterKeyHex) {
         try {
           const credSalt = cred.salt ? Buffer.from(cred.salt, 'hex') : undefined;
-          const { key } = deriveMasterKey(masterKeyHex, credSalt, cred.iter);
+          const key = await deriveMasterKeyAsync(masterKeyHex, credSalt, cred.iter);
           const payload: EncryptedPayload = {
             encrypted: cred.encryptedData,
             iv: cred.iv,
@@ -1055,6 +1013,8 @@ export class Dispatcher {
   private queue = new ExecutionQueue();
   /** Execution state machine — owns active/completed maps, tail buffer, progress, reviews. */
   private readonly lifecycle = new ExecutionLifecycle();
+  /** In-memory map of active executions for real-time streaming and status tracking. */
+  private active = new Map<string, ActiveExecution>();
   /**
    * Soft affinity map: personaId → workerId that last ran this persona.
    * Used for best-effort routing to reuse warm Claude sessions and cached
@@ -1074,16 +1034,37 @@ export class Dispatcher {
   readonly metrics = new OrchestratorMetrics();
   /** Periodic timer for queue/worker snapshot updates. */
   private metricsTimer: ReturnType<typeof setInterval>;
-  /** Composite sink for DB + Kafka + Metrics fan-out with isolated error handling. */
+  /** Composite sink for DB + Metrics fan-out with isolated error handling. */
   private readonly sink: CompositeSink;
   /** Resolves persona config (credentials, prompt, env) independently from dispatch routing. */
-  private readonly resolver: PersonaResolver;
+  private readonly resolver!: PersonaResolver;
+  private tenantDbManager: TenantDbManager | null = null;
+  private masterKey: Buffer | null = null;
+  private tenantKeyManager: TenantKeyManager | null = null;
+  private auditLog: AuditLog | null = null;
+  private preparer: ExecutionPreparer | null = null;
+  // Maps executionId → projectId for DB resolution during callbacks
+  private executionTenant = new Map<string, string>();
+  // Batched output buffers: executionId → pending chunks
+  private outputBuffers = new Map<string, string[]>();
+  private outputFlushTimer!: NodeJS.Timeout;
+  // Guard flag to prevent concurrent processQueue runs from racing on getIdleWorker/assign
+  private dispatching = false;
+  // Backpressure state
+  private backpressure!: QueueBackpressureConfig;
+  private tenantQueueCounts = new Map<string, number>();
+  private currentThresholdLevel: ThresholdLevel = 'normal';
+  // Interval counters — reset each time snapshotAndResetCounters() is called
+  private _intervalCompleted = 0;
+  private _intervalFailed = 0;
+  private _intervalCostUsd = 0;
+  /** Optional Fly Machines pool for on-demand worker VMs. */
+  private machinePool: MachinePool | null = null;
 
   constructor(
     private pool: WorkerPool,
     private tokenManager: TokenManager,
     private oauth: OAuthManager | null,
-    private kafka: KafkaClient,
     private logger: Logger,
     backpressureConfig?: Partial<QueueBackpressureConfig>,
   ) {
@@ -1098,14 +1079,11 @@ export class Dispatcher {
     this.outputFlushTimer = setInterval(() => this.flushOutputBuffers(), OUTPUT_FLUSH_INTERVAL_MS);
 
     // Build the composite sink — each sink handles its own errors independently.
-    this.sink = new CompositeSink(
-      [
-        new DbSink(() => this.database, this.logger),
-        new KafkaSink(this.kafka, this.logger),
-        new MetricsSink(this.metrics),
-      ],
-      this.metrics,
-    );
+    const sinks: ExecutionSink[] = [
+      new DbSink(() => this.database, this.logger),
+      new MetricsSink(this.metrics),
+    ];
+    this.sink = new CompositeSink(sinks, this.metrics);
 
     // --- Wire pool events to lifecycle transitions + sink fan-out ---
 
@@ -1123,25 +1101,11 @@ export class Dispatcher {
       const exec = this.active.get(msg.executionId);
       const line = '[STDERR] ' + msg.chunk;
       this.logger.warn({ executionId: msg.executionId, stderr: msg.chunk }, 'Execution stderr');
-      this.sink.onOutput(msg.executionId, line + '\n', exec?.projectId, {
-        executionId: msg.executionId, chunk: msg.chunk, timestamp: msg.timestamp,
-      });
+      this.sink.onOutput(msg.executionId, line + '\n', exec?.projectId);
     });
 
     // Handle execution completion
     this.pool.on('complete', (_workerId: string, msg: ExecComplete) => {
-      this.kafka.produce(TOPICS.EXEC_LIFECYCLE, JSON.stringify({
-        executionId: msg.executionId,
-        status: msg.status,
-        exitCode: msg.exitCode,
-        durationMs: msg.durationMs,
-        sessionId: msg.sessionId,
-        totalCostUsd: msg.totalCostUsd,
-        ...(msg.phaseTimings ? { phaseTimings: msg.phaseTimings } : {}),
-      }), msg.executionId).catch(err => {
-        this.logger.error({ err, executionId: msg.executionId }, 'Failed to produce lifecycle to Kafka');
-      });
-
       // Flush any remaining buffered output before persisting completion
       this.flushOutputForExecution(msg.executionId);
 
@@ -1167,6 +1131,9 @@ export class Dispatcher {
         // Remove from active after a short delay (allow polling to pick up final state)
         setTimeout(() => this.active.delete(msg.executionId), 30_000);
       }
+
+      // Notify MachinePool for cleanup (no-op if not a Fly Machine execution)
+      this.machinePool?.onComplete(msg.executionId);
 
       // Increment interval counters
       if (terminalStatus === 'completed') {
@@ -1203,31 +1170,15 @@ export class Dispatcher {
     this.pool.on('progress', (_workerId: string, msg: ExecProgress) => {
       const exec = this.active.get(msg.executionId);
       if (exec) {
-        exec.progress = { phase: msg.phase, percent: msg.percent, detail: msg.detail, updatedAt: msg.timestamp };
+        exec.progress = {
+          stage: msg.stage,
+          percentEstimate: msg.percentEstimate,
+          activeTool: msg.activeTool,
+          message: msg.message,
+          toolCallsCompleted: msg.toolCallsCompleted,
+          stageStartedAt: msg.timestamp,
+        };
       }
-      this.kafka.produce(TOPICS.EXEC_PROGRESS, JSON.stringify({
-        executionId: msg.executionId,
-        phase: msg.phase,
-        percent: msg.percent,
-        detail: msg.detail,
-        timestamp: msg.timestamp,
-      }), msg.executionId).catch(err => {
-        this.logger.error({ err, executionId: msg.executionId }, 'Failed to produce progress to Kafka');
-      });
-    });
-
-    // Forward persona events to Kafka (project-scoped)
-    this.pool.on('persona-event', (_workerId: string, msg: WorkerEvent) => {
-      const exec = this.active.get(msg.executionId);
-      const eventTopic = projectTopic(TOPICS.EVENTS, exec?.projectId);
-      this.kafka.produce(eventTopic, JSON.stringify({
-        executionId: msg.executionId,
-        eventType: msg.eventType,
-        payload: msg.payload,
-        timestamp: Date.now(),
-      }), msg.executionId).catch(err => {
-        this.logger.error({ err, executionId: msg.executionId }, 'Failed to produce event to Kafka');
-      });
     });
 
     // Handle worker busy nack — re-queue the rejected execution
@@ -1336,8 +1287,12 @@ export class Dispatcher {
           // Create a placeholder active entry to carry retry count across re-dispatch
           this.active.set(executionId, {
             workerId: '',
+            personaId: exec.personaId,
+            projectId: exec.projectId,
             startedAt: 0,
             output: [],
+            outputBytes: 0,
+            totalOutputLines: 0,
             status: 'running',
             request,
             disconnectRetries: nextRetry,
@@ -1373,13 +1328,6 @@ export class Dispatcher {
             } catch (err) { this.logger.warn({ err, executionId, op: 'updateExecution:failed' }, 'Failed to persist execution failure on worker disconnect'); }
           }
           this.executionTenant.delete(executionId);
-
-          this.kafka.produce(TOPICS.EXEC_LIFECYCLE, JSON.stringify({
-            executionId,
-            status: 'failed',
-            error: 'Worker disconnected (retries exhausted)',
-            durationMs: 0,
-          }), executionId).catch(err => { this.logger.warn({ err, executionId, op: 'kafka:exec_lifecycle' }, 'Failed to produce disconnect failure lifecycle to Kafka'); });
         }
       }
     });
@@ -1419,11 +1367,21 @@ export class Dispatcher {
   }
 
   async setMasterKey(masterKeyHex: string): Promise<void> {
+    this.masterKeyHex = masterKeyHex;
     this.masterKey = await deriveMasterKeyAsync(masterKeyHex);
+  }
+
+  /** Return the raw master-key hex (for credential decryption in validation, etc.). */
+  getMasterKey(): string | null {
+    return this.masterKeyHex;
   }
 
   setTenantKeyManager(mgr: TenantKeyManager): void {
     this.tenantKeyManager = mgr;
+  }
+
+  setMachinePool(pool: MachinePool): void {
+    this.machinePool = pool;
   }
 
   setAuditLog(log: AuditLog): void {
@@ -1513,7 +1471,8 @@ export class Dispatcher {
     for (const tenantId of tenantIds) {
       try {
         const tenantDb = this.tenantDbManager.getTenantDb(tenantId);
-        const queued = db.loadQueuedExecutions(tenantDb);
+        // TODO: implement loadQueuedExecutions in db module (returns queued executions with queue_data column)
+        const queued: Array<{ id: string; queueData: string; retryCount: number }> = []; // db.loadQueuedExecutions(tenantDb);
         for (const item of queued) {
           try {
             const request: ExecRequest = JSON.parse(item.queueData);
@@ -1589,8 +1548,8 @@ export class Dispatcher {
           projectId,
           eventId: request.eventId ?? null,
         });
-        // Store the full ExecRequest so we can recover on restart
-        db.storeQueueData(submitDb, request.executionId, JSON.stringify(request));
+        // TODO: implement storeQueueData in db module (persists ExecRequest JSON for crash recovery)
+        // db.storeQueueData(submitDb, request.executionId, JSON.stringify(request));
       } catch (err) {
         this.logger.error({ err, executionId: request.executionId }, 'Failed to create execution record');
       }
@@ -1628,16 +1587,32 @@ export class Dispatcher {
     try {
       while (this.queue.length > 0) {
         const workerId = this.pool.getIdleWorker();
-        if (!workerId) {
-          this.logger.debug({ queueLength: this.queue.length }, 'No idle worker, execution queued');
-          return;
+        if (workerId) {
+          const item = this.queue.shift()!;
+          const tenantId = item.request.projectId || 'default';
+          this.decrementTenantCount(tenantId);
+          this.checkThresholds();
+          await this.dispatchToWorker(workerId, item.request, item.receivedAt);
+          continue;
         }
 
-        const item = this.queue.shift()!;
-        const tenantId = item.request.projectId || 'default';
-        this.decrementTenantCount(tenantId);
-        this.checkThresholds();
-        await this.dispatchToWorker(workerId, item.request, item.receivedAt);
+        // No idle worker — if Fly Machines are enabled, spin one up.
+        // The machine connects back via WebSocket, triggers worker-ready,
+        // and the queued execution gets assigned through the normal flow.
+        if (this.machinePool) {
+          const item = this.queue.peek();
+          if (item) {
+            try {
+              await this.machinePool.requestMachine(item.request.executionId);
+              this.logger.debug({ executionId: item.request.executionId }, 'Fly Machine requested, execution stays queued');
+            } catch (err) {
+              this.logger.error({ err, executionId: item.request.executionId }, 'Fly Machine creation failed, execution stays queued for traditional workers');
+            }
+          }
+        } else {
+          this.logger.debug({ queueLength: this.queue.length }, 'No idle worker, execution queued');
+        }
+        return;
       }
     } finally {
       this.dispatching = false;
@@ -1689,8 +1664,12 @@ export class Dispatcher {
     const prevRetries = this.active.get(request.executionId)?.disconnectRetries ?? 0;
     this.active.set(request.executionId, {
       workerId,
+      personaId: request.personaId,
+      projectId: request.projectId,
       startedAt: Date.now(),
       output: [],
+      outputBytes: 0,
+      totalOutputLines: 0,
       status: 'running',
       request,
       disconnectRetries: prevRetries,
@@ -1771,7 +1750,8 @@ export class Dispatcher {
       this.sink.onFailed(request.executionId, errorMessage);
       // Also clear queue_data since we're permanently failing
       if (this.database) {
-        try { db.clearQueueData(this.database, request.executionId); } catch { /* best effort */ }
+        // TODO: implement clearQueueData in db module
+        // try { db.clearQueueData(this.database, request.executionId); } catch { /* best effort */ }
       }
       this.sink.onLifecycle(request.projectId, {
         executionId: request.executionId,
@@ -1940,7 +1920,7 @@ export class Dispatcher {
   }
 
   /** Shared handler for stdout/stderr output chunks. */
-  private handleOutputChunk(executionId: string, chunk: string, timestamp: number, prefix?: string): void {
+  private handleOutputChunk(executionId: string, chunk: string, _timestamp: number, prefix?: string): void {
     const line = prefix ? `${prefix}${chunk}` : chunk;
 
     const exec = this.active.get(executionId);
@@ -1949,17 +1929,6 @@ export class Dispatcher {
     }
 
     this.bufferOutput(executionId, line + '\n');
-
-    // Forward stdout to Kafka (stderr is not forwarded)
-    if (!prefix) {
-      this.kafka.produce(TOPICS.EXEC_OUTPUT, JSON.stringify({
-        executionId,
-        chunk,
-        timestamp,
-      }), executionId).catch(err => {
-        this.logger.error({ err, executionId }, 'Failed to produce output to Kafka');
-      });
-    }
   }
 
   /** Buffer an output chunk for batched DB write. */
@@ -2070,8 +2039,8 @@ export class Dispatcher {
   }
 
   /**
-   * Check queue depth against warning/critical thresholds and emit Kafka
-   * metrics when the level changes.
+   * Check queue depth against warning/critical thresholds and log
+   * when the level changes.
    */
   private checkThresholds(): void {
     const depth = this.queue.length;
@@ -2095,17 +2064,6 @@ export class Dispatcher {
         warningThreshold,
         criticalThreshold,
       }, 'Queue threshold level changed');
-
-      this.kafka.produce(TOPICS.QUEUE_METRICS, JSON.stringify({
-        event: 'threshold_crossed',
-        previousLevel,
-        newLevel,
-        queueDepth: depth,
-        maxQueueDepth: this.backpressure.maxQueueDepth,
-        timestamp: Date.now(),
-      })).catch(err => {
-        this.logger.error({ err }, 'Failed to produce queue metrics to Kafka');
-      });
     }
   }
 

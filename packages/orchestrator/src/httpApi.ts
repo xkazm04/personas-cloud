@@ -3,7 +3,7 @@ import { createHmac, randomBytes } from 'node:crypto';
 import { nanoid } from 'nanoid';
 import type { ZodSchema } from 'zod';
 import { encrypt, createPersonaWithDefaults, createToolDefinitionWithDefaults, assembleCompilationPrompt, assembleBatchCompilationPrompt, validatePayloadFilter, parseModelProfile, parsePermissionPolicy, decrypt, deriveMasterKey } from '@dac-cloud/shared';
-import type { ExecRequest, Persona, PersonaToolDefinition, CompileRequest, BatchCompileRequest, CompileResult, BatchCompileResult, BatchCompileItemResult, EncryptedPayload } from '@dac-cloud/shared';
+import type { ExecRequest, Persona, PersonaToolDefinition, CompileRequest, BatchCompileRequest, CompileResult, BatchCompileResult, BatchCompileItemResult, EncryptedPayload, EventStatus } from '@dac-cloud/shared';
 import type Database from 'better-sqlite3';
 import { safeCompare } from './auth.js';
 import type { Auth, RequestContext } from './auth.js';
@@ -11,7 +11,6 @@ import type { Dispatcher, SubmitResult } from './dispatcher.js';
 import type { WorkerPool } from './workerPool.js';
 import type { TokenManager } from './tokenManager.js';
 import type { OAuthManager } from './oauth.js';
-import type { KafkaClient } from './kafka.js';
 import { handleOAuthRoute } from './oauthHttpHandlers.js';
 import { handleTriggerRoute } from './triggerHttpHandlers.js';
 import type { TriggerSchedulerHandle } from './triggerScheduler.js';
@@ -22,7 +21,7 @@ import type { EventProcessorHealth } from './eventProcessor.js';
 import type { RetentionHealth } from './retention.js';
 import type { Logger } from 'pino';
 import * as db from './db/index.js';
-import { readBody, json } from './httpUtils.js';
+// readBody and json are defined locally in this file (readBody supports maxBytes param)
 
 // --- Route types ---
 
@@ -65,8 +64,7 @@ function parseRoute(pathname: string): ParsedRoute | null {
     subResource: segments[2],
   };
 }
-=======
-import * as db from './db.js';
+
 import { gitlabEventType } from './gitlab.js';
 import {
   OAuthCallbackSchema, SetTokenSchema, ExecuteSchema,
@@ -619,6 +617,8 @@ const AUTHENTICATED_ROUTES: AuthRoute[] = [
         maxConcurrent: body.maxConcurrent ?? existing?.maxConcurrent ?? 1,
         timeoutMs: body.timeoutMs ?? existing?.timeoutMs ?? 300_000,
         modelProfile: body.modelProfile ?? existing?.modelProfile ?? null,
+        inferenceProfileId: body.inferenceProfileId ?? existing?.inferenceProfileId ?? null,
+        networkPolicy: body.networkPolicy ?? existing?.networkPolicy ?? null,
         maxBudgetUsd: body.maxBudgetUsd ?? existing?.maxBudgetUsd ?? null,
         maxTurns: body.maxTurns ?? existing?.maxTurns ?? null,
         designContext: body.designContext ?? existing?.designContext ?? null,
@@ -764,7 +764,7 @@ const AUTHENTICATED_ROUTES: AuthRoute[] = [
       const subUpResult = await parseAndValidate(rc.req, SubscriptionUpdateSchema);
       if (!subUpResult.ok) { json(rc.res, 400, { error: subUpResult.error }); return; }
       const subUpdates: Record<string, unknown> = { ...subUpResult.data };
-      db.updateSubscription(rc.database!, id, subUpdates as Parameters<typeof db.updateSubscription>[2], rc.scopedProjectId);
+      db.updateSubscription(rc.database!, id, subUpdates as Parameters<typeof db.updateSubscription>[2]);
       const updated = db.getSubscription(rc.database!, id);
       json(rc.res, 200, updated);
     } },
@@ -776,7 +776,7 @@ const AUTHENTICATED_ROUTES: AuthRoute[] = [
         if (!sub) { json(rc.res, 404, { error: 'Not found' }); return; }
         if (!requireOwnership(rc.res, db.getPersona(rc.database!, sub.personaId), rc.scopedProjectId)) return;
       }
-      db.deleteSubscription(rc.database!, id, rc.scopedProjectId);
+      db.deleteSubscription(rc.database!, id);
       json(rc.res, 200, { deleted: true });
     } },
   { method: 'GET', match: 'prefix', path: '/api/personas/', suffix: '/subscriptions', requiresDb: true,
@@ -809,7 +809,7 @@ const AUTHENTICATED_ROUTES: AuthRoute[] = [
       const trigUpResult = await parseAndValidate(rc.req, TriggerUpdateSchema);
       if (!trigUpResult.ok) { json(rc.res, 400, { error: trigUpResult.error }); return; }
       const trigUpdates: Record<string, unknown> = { ...trigUpResult.data };
-      db.updateTrigger(rc.database!, id, trigUpdates as Parameters<typeof db.updateTrigger>[2], rc.scopedProjectId);
+      db.updateTrigger(rc.database!, id, trigUpdates as Parameters<typeof db.updateTrigger>[2]);
       const updated = db.getTrigger(rc.database!, id);
       json(rc.res, 200, updated);
     } },
@@ -846,7 +846,7 @@ const AUTHENTICATED_ROUTES: AuthRoute[] = [
     excludeSuffixes: ['/firings', '/stats'],
     handler: (rc) => {
       const id = rc.param('/api/triggers/');
-      db.deleteTrigger(rc.database!, id, rc.scopedProjectId);
+      db.deleteTrigger(rc.database!, id);
       json(rc.res, 200, { deleted: true });
     } },
   { method: 'GET', match: 'prefix', path: '/api/personas/', suffix: '/triggers', requiresDb: true,
@@ -862,7 +862,7 @@ const AUTHENTICATED_ROUTES: AuthRoute[] = [
       const params = new URLSearchParams(rc.queryString || '');
       const events = db.listEvents(rc.database!, {
         eventType: params.get('eventType') ?? undefined,
-        status: params.get('status') ?? undefined,
+        status: (params.get('status') ?? undefined) as EventStatus | undefined,
         limit: clampInt(params.get('limit'), 50, 1, MAX_LIMIT),
         offset: clampInt(params.get('offset'), 0, 0, Number.MAX_SAFE_INTEGER),
         projectId: rc.scopedProjectId,
@@ -911,7 +911,7 @@ const AUTHENTICATED_ROUTES: AuthRoute[] = [
       const id = rc.param('/api/events/');
       const evtUpResult = await parseAndValidate(rc.req, EventUpdateSchema);
       if (!evtUpResult.ok) { json(rc.res, 400, { error: evtUpResult.error }); return; }
-      const updated = db.updateEventWithMetadata(rc.database!, id, evtUpResult.data.status, evtUpResult.data.metadata);
+      const updated = db.updateEventWithMetadata(rc.database!, id, evtUpResult.data.status as EventStatus, evtUpResult.data.metadata);
       if (updated) {
         json(rc.res, 200, updated);
       } else {
@@ -1144,11 +1144,16 @@ export function createHttpApi(
   tenantKeyManager?: TenantKeyManager,
   auditLog?: AuditLog,
   getEventProcessorHealth?: () => EventProcessorHealth,
-  kafka?: KafkaClient,
   onEventPublished?: () => void,
   triggerScheduler?: TriggerSchedulerHandle,
   getRetentionHealth?: () => RetentionHealth,
+  corsOrigins: string[] = [],
+  corsWildcard: boolean = false,
+  trustedProxyCount: number = 0,
+  gitlabWebhookSecret: string = '',
 ): http.Server {
+
+  const allowedOrigins = new Set(corsOrigins);
 
   /** Wrap a mutation handler to emit an audit event on successful response. */
   function withHttpAudit(handler: RouteHandler, action: AuditAction, resourceType: string): RouteHandler {
@@ -1683,36 +1688,6 @@ export function createHttpApi(
   });
 
   // ── Request handler ──
-  const server = http.createServer(async (req, res) => {
-    // Request correlation ID
-    const reqId = nanoid();
-    const reqLogger = logger.child({ reqId });
-    res.setHeader('X-Request-Id', reqId);
-
-    // Security headers
-    res.setHeader('X-Content-Type-Options', 'nosniff');
-
-    // CORS headers
-    const origin = req.headers.origin ?? '';
-    const allowedOrigin = process.env['CORS_ALLOWED_ORIGIN'] || '*';
-    const isAdminRoute = (req.url ?? '').startsWith('/api/admin');
-    if (isAdminRoute) {
-      if (origin && origin === allowedOrigin) {
-        res.setHeader('Access-Control-Allow-Origin', origin);
-      }
-    } else {
-      res.setHeader('Access-Control-Allow-Origin', allowedOrigin);
-    }
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-User-Token');
-=======
-  gitlabWebhookSecret?: string,
-  corsOrigins?: string[],
-  onEventPublished?: () => void,
-  trustedProxyCount: number = 0,
-  corsWildcard: boolean = false,
-): http.Server {
-  const allowedOrigins = new Set(corsOrigins ?? []);
   const rateLimiter = createRateLimiter();
   const idempotencyCache = createIdempotencyCache();
 
@@ -1747,9 +1722,11 @@ export function createHttpApi(
     const url = req.url || '/';
     const [pathname, queryString] = url.split('?');
     const route = parseRoute(pathname ?? '');
+    const reqId = nanoid();
+    const reqLogger = logger.child({ reqId, method: req.method, url });
 
     // Unauthenticated endpoint
-=======
+
     // Rate limiting (by IP, per endpoint category)
     const clientIp = getClientIp(req, trustedProxyCount);
     const rateCategory = classifyEndpoint(pathname ?? '/', req.method ?? 'GET');
@@ -1796,12 +1773,12 @@ export function createHttpApi(
 
     // Unauthenticated endpoints
     if (pathname === '/health' && req.method === 'GET') {
-      await handleHealth(res, pool, dispatcher, tokenManager, oauth, getEventProcessorHealth, database, tenantDbManager, kafka, triggerScheduler, auditLog, getRetentionHealth);
+      await handleHealth(res, pool, dispatcher, tokenManager, oauth, getEventProcessorHealth, database, tenantDbManager, triggerScheduler, auditLog, getRetentionHealth);
       return;
     }
 
     // Auth check
-=======
+
     // Prometheus-compatible metrics endpoint
     if (pathname === '/metrics' && req.method === 'GET') {
       if (!auth.validateRequest(req)) {
@@ -2032,34 +2009,7 @@ export function createHttpApi(
 
       // No matching route
       json(res, 404, { error: 'Not found', reqId });
-=======
-    // Dispatch to the declarative route table
-    const route = findRoute(AUTHENTICATED_ROUTES, req.method ?? 'GET', pathname ?? '/', !!database);
-    if (!route) {
-      res.writeHead(404, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Not found' }));
-      return;
-    }
 
-    // Admin gate
-    if (route.admin && requireAdmin(ctx, res)) return;
-
-    const routeCtx: RouteCtx = {
-      req, res, ctx, scopedProjectId,
-      database: database ?? null,
-      dispatcher, pool, tokenManager, oauth, logger,
-      pathname: pathname ?? '/',
-      queryString,
-      onEventPublished,
-      param(prefix: string, suffix?: string) {
-        let id = (pathname ?? '/').slice(prefix.length);
-        if (suffix && id.endsWith(suffix)) id = id.slice(0, -suffix.length);
-        return id;
-      },
-    };
-
-    try {
-      await route.handler(routeCtx);
     } catch (err) {
       if (err instanceof Error && err.message === 'Payload too large') {
         res.writeHead(413, { 'Content-Type': 'application/json' });
@@ -2094,7 +2044,8 @@ function withScopedEntity<T extends { projectId?: string | null }>(
     return null;
   }
   return entity;
-=======
+}
+
 /** Strip webhookSecret from deployment objects in API responses. */
 function redactDeployment<T extends { webhookSecret?: unknown }>(deployment: T): Omit<T, 'webhookSecret'> & { hasWebhookSecret: boolean } {
   const { webhookSecret, ...rest } = deployment;
@@ -2142,7 +2093,6 @@ function requireAdmin(ctx: RequestContext, res: http.ServerResponse): boolean {
   return false;
 }
 
-=======
 // --- OAuth handlers ---
 
 function handleOAuthAuthorize(res: http.ServerResponse, oauth: OAuthManager): void {
@@ -2172,23 +2122,23 @@ async function handleOAuthCallback(
   if (!result.ok) { json(res, 400, { error: result.error }); return; }
   const parsed = result.data;
 
-  const tokens = await oauth.exchangeCode(parsed.code, parsed.state);
-  if (!tokens) {
+  const result2 = await oauth.exchangeCode(parsed.code, parsed.state);
+  if (!result2 || !result2.ok) {
     res.writeHead(401, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'OAuth token exchange failed' }));
     return;
   }
 
   // Also store the access token in TokenManager for backward compatibility
-  tokenManager.storeClaudeToken(tokens.accessToken);
+  tokenManager.storeClaudeToken(result2.tokens.accessToken);
 
   logger.info('OAuth flow completed, subscription connected');
 
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({
     status: 'connected',
-    scopes: tokens.scopes,
-    expiresAt: new Date(tokens.expiresAt).toISOString(),
+    scopes: result2.tokens.scopes,
+    expiresAt: new Date(result2.tokens.expiresAt).toISOString(),
   }));
 }
 
@@ -2209,20 +2159,20 @@ async function handleOAuthRefresh(
   tokenManager: TokenManager,
   logger: Logger,
 ): Promise<void> {
-  const tokens = await oauth.refreshAccessToken();
-  if (!tokens) {
+  const refreshResult = await oauth.refreshAccessToken();
+  if (!refreshResult || !refreshResult.ok) {
     res.writeHead(500, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'Token refresh failed' }));
     return;
   }
 
-  tokenManager.storeClaudeToken(tokens.accessToken);
+  tokenManager.storeClaudeToken(refreshResult.tokens.accessToken);
   logger.info('OAuth token refreshed via API');
 
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({
     status: 'refreshed',
-    expiresAt: new Date(tokens.expiresAt).toISOString(),
+    expiresAt: new Date(refreshResult.tokens.expiresAt).toISOString(),
   }));
 }
 
@@ -2270,7 +2220,6 @@ async function handleHealth(
   getEventProcessorHealth?: () => EventProcessorHealth,
   database?: Database.Database,
   tenantDbManager?: TenantDbManager,
-  kafka?: KafkaClient,
   triggerScheduler?: TriggerSchedulerHandle,
   auditLog?: AuditLog,
   getRetentionHealth?: () => RetentionHealth,
@@ -2310,15 +2259,6 @@ async function handleHealth(
     }
   }
 
-  let kafkaHealth: Record<string, unknown> = { status: 'disabled' };
-  if (kafka) {
-    const kh = await kafka.checkHealth();
-    kafkaHealth = { status: kh.status, ...(kh.detail ? { detail: kh.detail } : {}) };
-    if (kh.status === 'error') {
-      issues.push(`kafka: ${kh.detail || 'error'}`);
-    }
-  }
-
   const queueDepth = dispatcher.getQueueLength();
   const activeExecutions = dispatcher.getActiveExecutions().length;
 
@@ -2333,7 +2273,7 @@ async function handleHealth(
   }
 
   let verdict: 'healthy' | 'degraded' | 'unhealthy';
-  if (issues.some(i => i.includes('database unreachable') || i.includes('kafka: '))) {
+  if (issues.some(i => i.includes('database unreachable'))) {
     verdict = 'unhealthy';
   } else if (issues.length > 0) {
     verdict = 'degraded';
@@ -2346,7 +2286,6 @@ async function handleHealth(
     timestamp: Date.now(),
     dependencies: {
       database: dbHealth,
-      kafka: kafkaHealth,
       workers: {
         ...counts,
         staleWorkers: staleWorkers.length > 0 ? staleWorkers : undefined,
@@ -2444,23 +2383,20 @@ async function handleExecute(
     },
   };
 
-  const result: SubmitResult = dispatcher.submit(request);
+  const submitResult: SubmitResult = dispatcher.submit(request);
 
-  if (!result.accepted) {
-    logger.warn({ executionId: request.executionId, reason: result.reason }, 'Execution rejected by backpressure');
+  if (!submitResult.accepted) {
+    logger.warn({ executionId: request.executionId, reason: submitResult.reason }, 'Execution rejected by backpressure');
     res.writeHead(429, {
       'Content-Type': 'application/json',
-      'Retry-After': String(result.retryAfterSeconds),
+      'Retry-After': String(submitResult.retryAfterSeconds),
     });
     res.end(JSON.stringify({
-      error: result.reason === 'tenant_quota_exceeded'
+      error: submitResult.reason === 'tenant_quota_exceeded'
         ? 'Per-tenant queue quota exceeded'
         : 'Queue depth limit exceeded',
-      retryAfterSeconds: result.retryAfterSeconds,
+      retryAfterSeconds: submitResult.retryAfterSeconds,
     }));
-=======
-  if (!dispatcher.submit(request)) {
-    json(res, 429, { error: 'Execution queue is full — try again later' });
     return;
   }
 
@@ -2502,7 +2438,6 @@ function handleGetExecution(
     sessionId: exec.sessionId,
     totalCostUsd: exec.totalCostUsd,
     ...(exec.phaseTimings ? { phaseTimings: exec.phaseTimings } : {}),
-=======
     costUsd: exec.totalCostUsd, // backward-compat alias for desktop client
     progress: exec.source === 'live' ? exec.progress ?? null : null,
     pendingReviews: exec.source === 'live'
@@ -2639,7 +2574,8 @@ function clampQueryInt(value: string | null, defaultValue: number, max: number):
   const parsed = parseInt(value, 10);
   if (!Number.isFinite(parsed) || parsed < 0) return defaultValue;
   return Math.min(parsed, max);
-=======
+}
+
 // --- Compilation handlers ---
 
 async function handleCompile(
@@ -2660,7 +2596,7 @@ async function handleCompile(
   if (body.tools && body.tools.length > 0 && database) {
     const allTools = db.listToolDefinitions(database);
     const toolNames = new Set(body.tools);
-    availableTools = allTools.filter(t => toolNames.has(t.name));
+    availableTools = allTools.filter((t: PersonaToolDefinition) => toolNames.has(t.name));
   }
 
   // Build the compilation prompt
@@ -2838,6 +2774,8 @@ function parsedDesignToPersona(parsed: Record<string, unknown>, id: string, proj
     maxConcurrent: 1,
     timeoutMs: 300_000,
     modelProfile: null,
+    inferenceProfileId: null,
+    networkPolicy: null,
     maxBudgetUsd: null,
     maxTurns: null,
     designContext: JSON.stringify(parsed),
@@ -3070,7 +3008,7 @@ function validatePersona(
       issues.push({ level: 'warning', category: 'tools', message: `Tool "${tool.name}" has no description — the LLM may not know when to use it` });
     }
     if (tool.requiresCredentialType) {
-      const hasCred = creds.some(c => c.serviceType === tool.requiresCredentialType);
+      const hasCred = creds.some((c: { serviceType?: string }) => c.serviceType === tool.requiresCredentialType);
       if (!hasCred) {
         issues.push({
           level: 'error',

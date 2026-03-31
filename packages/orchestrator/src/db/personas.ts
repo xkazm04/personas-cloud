@@ -36,6 +36,9 @@ const rowToPersona = createRowMapper<Persona>({
   maxTurns: { col: 'max_turns', nullable: true },
   designContext: { col: 'design_context', nullable: true },
   groupId: { col: 'group_id', nullable: true },
+  permissionPolicy: { col: 'permission_policy', nullable: true },
+  webhookSecret: { col: 'webhook_secret', nullable: true },
+  modelProfile: { col: 'model_profile', nullable: true },
   createdAt: { col: 'created_at' },
   updatedAt: { col: 'updated_at' },
 });

@@ -110,6 +110,9 @@ CREATE TABLE IF NOT EXISTS personas (
   max_turns INTEGER,
   design_context TEXT,
   group_id TEXT,
+  permission_policy TEXT,
+  webhook_secret TEXT,
+  model_profile TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -163,7 +166,7 @@ CREATE TABLE IF NOT EXISTS persona_events (
   source_id TEXT,
   target_persona_id TEXT,
   payload TEXT,
-  status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','processing','delivered','skipped','failed','partial','partial-retry')),
+  status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','processing','delivered','skipped','failed','partial','partial-retry','dead_letter')),
   error_message TEXT,
   processed_at TEXT,
   use_case_id TEXT,
@@ -180,7 +183,10 @@ CREATE TABLE IF NOT EXISTS persona_event_subscriptions (
   persona_id TEXT NOT NULL REFERENCES personas(id) ON DELETE CASCADE,
   event_type TEXT NOT NULL,
   source_filter TEXT,
+  payload_filter TEXT,
   enabled INTEGER NOT NULL DEFAULT 1,
+  max_retries INTEGER NOT NULL DEFAULT 3,
+  retry_backoff_ms INTEGER NOT NULL DEFAULT 5000,
   use_case_id TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
@@ -196,6 +202,8 @@ CREATE TABLE IF NOT EXISTS persona_triggers (
   enabled INTEGER NOT NULL DEFAULT 1,
   last_triggered_at TEXT,
   next_trigger_at TEXT,
+  health_status TEXT NOT NULL DEFAULT 'healthy',
+  health_message TEXT,
   use_case_id TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
@@ -245,6 +253,43 @@ CREATE INDEX IF NOT EXISTS idx_pex_created_status ON persona_executions(created_
 ${DAILY_METRICS_TABLE}
 
 ${INFERENCE_PROFILES_TABLE}
+
+CREATE TABLE IF NOT EXISTS event_audit (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  event_id TEXT NOT NULL,
+  action TEXT NOT NULL,
+  detail TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ea_event ON event_audit(event_id, created_at);
+
+CREATE TABLE IF NOT EXISTS event_dispatches (
+  event_id TEXT NOT NULL,
+  persona_id TEXT NOT NULL,
+  execution_id TEXT,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (event_id, persona_id)
+);
+
+CREATE TABLE IF NOT EXISTS cloud_deployments (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL DEFAULT 'default',
+  persona_id TEXT NOT NULL,
+  slug TEXT NOT NULL UNIQUE,
+  label TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','paused','failed')),
+  webhook_enabled INTEGER NOT NULL DEFAULT 1,
+  webhook_secret TEXT,
+  invocation_count INTEGER NOT NULL DEFAULT 0,
+  last_invoked_at TEXT,
+  max_monthly_budget_usd REAL,
+  current_month_cost_usd REAL NOT NULL DEFAULT 0,
+  budget_month TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_cd_persona ON cloud_deployments(persona_id);
+CREATE INDEX IF NOT EXISTS idx_cd_slug ON cloud_deployments(slug);
 `;
 
 // ---------------------------------------------------------------------------
@@ -314,6 +359,86 @@ function runLegacyMigrations(db: Database.Database, logger: Logger): void {
 
   // Add new metric columns to daily_metrics
   runDailyMetricsMigrations(db, logger, 'Migration');
+
+  // Add health_status / health_message to persona_triggers if missing
+  const triggerCols = stmt(db, 'PRAGMA table_info(persona_triggers)').all() as Array<{ name: string }>;
+  if (!triggerCols.some(c => c.name === 'health_status')) {
+    db.exec("ALTER TABLE persona_triggers ADD COLUMN health_status TEXT NOT NULL DEFAULT 'healthy'");
+    logger.info('Migration: added health_status to persona_triggers');
+  }
+  if (!triggerCols.some(c => c.name === 'health_message')) {
+    db.exec('ALTER TABLE persona_triggers ADD COLUMN health_message TEXT');
+    logger.info('Migration: added health_message to persona_triggers');
+  }
+
+  // Add permission_policy, webhook_secret, model_profile to personas if missing
+  if (!personaCols.some(c => c.name === 'permission_policy')) {
+    db.exec('ALTER TABLE personas ADD COLUMN permission_policy TEXT');
+    logger.info('Migration: added permission_policy to personas');
+  }
+  if (!personaCols.some(c => c.name === 'webhook_secret')) {
+    db.exec('ALTER TABLE personas ADD COLUMN webhook_secret TEXT');
+    logger.info('Migration: added webhook_secret to personas');
+  }
+  if (!personaCols.some(c => c.name === 'model_profile')) {
+    db.exec('ALTER TABLE personas ADD COLUMN model_profile TEXT');
+    logger.info('Migration: added model_profile to personas');
+  }
+
+  // Add payload_filter, max_retries, retry_backoff_ms to persona_event_subscriptions if missing
+  const subCols = stmt(db, 'PRAGMA table_info(persona_event_subscriptions)').all() as Array<{ name: string }>;
+  if (!subCols.some(c => c.name === 'payload_filter')) {
+    db.exec('ALTER TABLE persona_event_subscriptions ADD COLUMN payload_filter TEXT');
+    logger.info('Migration: added payload_filter to persona_event_subscriptions');
+  }
+  if (!subCols.some(c => c.name === 'max_retries')) {
+    db.exec('ALTER TABLE persona_event_subscriptions ADD COLUMN max_retries INTEGER NOT NULL DEFAULT 3');
+    logger.info('Migration: added max_retries to persona_event_subscriptions');
+  }
+  if (!subCols.some(c => c.name === 'retry_backoff_ms')) {
+    db.exec('ALTER TABLE persona_event_subscriptions ADD COLUMN retry_backoff_ms INTEGER NOT NULL DEFAULT 5000');
+    logger.info('Migration: added retry_backoff_ms to persona_event_subscriptions');
+  }
+
+  // Create new tables if they don't exist (event_audit, event_dispatches, cloud_deployments)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS event_audit (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      event_id TEXT NOT NULL,
+      action TEXT NOT NULL,
+      detail TEXT,
+      created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_ea_event ON event_audit(event_id, created_at);
+
+    CREATE TABLE IF NOT EXISTS event_dispatches (
+      event_id TEXT NOT NULL,
+      persona_id TEXT NOT NULL,
+      execution_id TEXT,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (event_id, persona_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS cloud_deployments (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL DEFAULT 'default',
+      persona_id TEXT NOT NULL,
+      slug TEXT NOT NULL UNIQUE,
+      label TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','paused','failed')),
+      webhook_enabled INTEGER NOT NULL DEFAULT 1,
+      webhook_secret TEXT,
+      invocation_count INTEGER NOT NULL DEFAULT 0,
+      last_invoked_at TEXT,
+      max_monthly_budget_usd REAL,
+      current_month_cost_usd REAL NOT NULL DEFAULT 0,
+      budget_month TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_cd_persona ON cloud_deployments(persona_id);
+    CREATE INDEX IF NOT EXISTS idx_cd_slug ON cloud_deployments(slug);
+  `);
 }
 
 // ---------------------------------------------------------------------------
@@ -428,4 +553,85 @@ function runTenantMigrations(db: Database.Database, logger: Logger): void {
 
   // Add new metric columns to daily_metrics
   runDailyMetricsMigrations(db, logger, 'Tenant migration');
+
+  // Add health_status / health_message to persona_triggers if missing
+  const triggerCols = stmt(db, 'PRAGMA table_info(persona_triggers)').all() as Array<{ name: string }>;
+  if (!triggerCols.some(c => c.name === 'health_status')) {
+    db.exec("ALTER TABLE persona_triggers ADD COLUMN health_status TEXT NOT NULL DEFAULT 'healthy'");
+    logger.info('Tenant migration: added health_status to persona_triggers');
+  }
+  if (!triggerCols.some(c => c.name === 'health_message')) {
+    db.exec('ALTER TABLE persona_triggers ADD COLUMN health_message TEXT');
+    logger.info('Tenant migration: added health_message to persona_triggers');
+  }
+
+  // Add permission_policy, webhook_secret, model_profile to personas if missing
+  const personaCols = stmt(db, 'PRAGMA table_info(personas)').all() as Array<{ name: string }>;
+  if (!personaCols.some(c => c.name === 'permission_policy')) {
+    db.exec('ALTER TABLE personas ADD COLUMN permission_policy TEXT');
+    logger.info('Tenant migration: added permission_policy to personas');
+  }
+  if (!personaCols.some(c => c.name === 'webhook_secret')) {
+    db.exec('ALTER TABLE personas ADD COLUMN webhook_secret TEXT');
+    logger.info('Tenant migration: added webhook_secret to personas');
+  }
+  if (!personaCols.some(c => c.name === 'model_profile')) {
+    db.exec('ALTER TABLE personas ADD COLUMN model_profile TEXT');
+    logger.info('Tenant migration: added model_profile to personas');
+  }
+
+  // Add payload_filter, max_retries, retry_backoff_ms to persona_event_subscriptions if missing
+  const subCols = stmt(db, 'PRAGMA table_info(persona_event_subscriptions)').all() as Array<{ name: string }>;
+  if (!subCols.some(c => c.name === 'payload_filter')) {
+    db.exec('ALTER TABLE persona_event_subscriptions ADD COLUMN payload_filter TEXT');
+    logger.info('Tenant migration: added payload_filter to persona_event_subscriptions');
+  }
+  if (!subCols.some(c => c.name === 'max_retries')) {
+    db.exec('ALTER TABLE persona_event_subscriptions ADD COLUMN max_retries INTEGER NOT NULL DEFAULT 3');
+    logger.info('Tenant migration: added max_retries to persona_event_subscriptions');
+  }
+  if (!subCols.some(c => c.name === 'retry_backoff_ms')) {
+    db.exec('ALTER TABLE persona_event_subscriptions ADD COLUMN retry_backoff_ms INTEGER NOT NULL DEFAULT 5000');
+    logger.info('Tenant migration: added retry_backoff_ms to persona_event_subscriptions');
+  }
+
+  // Create new tables if they don't exist
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS event_audit (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      event_id TEXT NOT NULL,
+      action TEXT NOT NULL,
+      detail TEXT,
+      created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_ea_event ON event_audit(event_id, created_at);
+
+    CREATE TABLE IF NOT EXISTS event_dispatches (
+      event_id TEXT NOT NULL,
+      persona_id TEXT NOT NULL,
+      execution_id TEXT,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (event_id, persona_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS cloud_deployments (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL DEFAULT 'default',
+      persona_id TEXT NOT NULL,
+      slug TEXT NOT NULL UNIQUE,
+      label TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','paused','failed')),
+      webhook_enabled INTEGER NOT NULL DEFAULT 1,
+      webhook_secret TEXT,
+      invocation_count INTEGER NOT NULL DEFAULT 0,
+      last_invoked_at TEXT,
+      max_monthly_budget_usd REAL,
+      current_month_cost_usd REAL NOT NULL DEFAULT 0,
+      budget_month TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_cd_persona ON cloud_deployments(persona_id);
+    CREATE INDEX IF NOT EXISTS idx_cd_slug ON cloud_deployments(slug);
+  `);
 }

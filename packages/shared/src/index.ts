@@ -5,7 +5,6 @@ export * from './types.js';
 export * from './prompt.js';
 export * from './bus.js';
 export * from './scrubber.js';
-export * from './envelope.js';
 export * from './inferenceProfiles.js';
 export * from './networkPolicy.js';
 export * from './factories.js';

@@ -1,0 +1,87 @@
+# =============================================================================
+# Local development / testing environment
+# No Kafka dependency (Phase 1: SQLite event bus + WebSocket output)
+#
+# Usage:
+#   1. Copy .env.example → .env and fill in secrets
+#   2. docker compose build
+#   3. docker compose up
+#   4. Orchestrator API: http://localhost:3001/health
+#   5. Worker connects to orchestrator automatically via internal network
+# =============================================================================
+
+services:
+  # ---------------------------------------------------------------------------
+  # Orchestrator — HTTP API + WebSocket server + event processing
+  # ---------------------------------------------------------------------------
+  orchestrator:
+    build:
+      context: .
+      dockerfile: packages/orchestrator/Dockerfile
+    ports:
+      - "${HTTP_PORT:-3001}:3001"       # HTTP API
+      - "${WS_PORT:-8443}:8443"         # Worker WebSocket
+    volumes:
+      - orchestrator-data:/app/data     # SQLite persistence
+    environment:
+      # Required secrets (override via .env file)
+      MASTER_KEY: ${MASTER_KEY:?Set MASTER_KEY in .env (openssl rand -hex 32)}
+      TEAM_API_KEY: ${TEAM_API_KEY:?Set TEAM_API_KEY in .env (openssl rand -hex 24)}
+      WORKER_TOKEN: ${WORKER_TOKEN:?Set WORKER_TOKEN in .env (openssl rand -hex 24)}
+      # Optional Claude token (or use OAuth flow)
+      CLAUDE_TOKEN: ${CLAUDE_TOKEN:-}
+      # Kafka disabled by default (Phase 1)
+      # KAFKA_ENABLED: "false"
+      # Auth: admin fallback for local dev (no Supabase JWT needed)
+      ENABLE_ADMIN_FALLBACK: "1"
+      # TLS disabled for local dev
+      TLS_ENABLED: "false"
+      # CORS: allow local dev origins
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000,http://localhost:5173}
+      # Ports
+      WS_PORT: "8443"
+      HTTP_PORT: "3001"
+      # Logging
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      # Supabase (optional)
+      SUPABASE_JWT_SECRET: ${SUPABASE_JWT_SECRET:-}
+      SUPABASE_PROJECT_REF: ${SUPABASE_PROJECT_REF:-}
+      # GitLab (optional)
+      GITLAB_WEBHOOK_SECRET: ${GITLAB_WEBHOOK_SECRET:-}
+      # Fly Machines (optional — on-demand workers)
+      FLY_MACHINES_ENABLED: ${FLY_MACHINES_ENABLED:-false}
+      FLY_APP_NAME: ${FLY_APP_NAME:-}
+      FLY_API_TOKEN: ${FLY_API_TOKEN:-}
+      FLY_REGION: ${FLY_REGION:-iad}
+      FLY_WORKER_IMAGE: ${FLY_WORKER_IMAGE:-}
+      FLY_ORCHESTRATOR_WS_URL: ${FLY_ORCHESTRATOR_WS_URL:-ws://orchestrator:8443}
+    healthcheck:
+      test: ["CMD", "node", "-e", "const h=require('http');h.get('http://localhost:3001/health',r=>{process.exit(r.statusCode===200?0:1)}).on('error',()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Worker — connects to orchestrator, executes personas via Claude CLI
+  # ---------------------------------------------------------------------------
+  worker:
+    build:
+      context: .
+      dockerfile: packages/worker/Dockerfile
+    environment:
+      ORCHESTRATOR_URL: ws://orchestrator:8443
+      WORKER_TOKEN: ${WORKER_TOKEN:?Set WORKER_TOKEN in .env}
+      WORKER_ID: ${WORKER_ID:-local-worker-1}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      # Claude API key (BYOK — required for the worker to execute personas)
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    depends_on:
+      orchestrator:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  orchestrator-data:
+    driver: local

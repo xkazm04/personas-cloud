@@ -14,7 +14,9 @@
     "build:worker": "npm run build -w packages/worker",
     "dev:orchestrator": "npx tsx packages/orchestrator/src/index.ts",
     "dev:worker": "npx tsx packages/worker/src/index.ts",
-    "typecheck": "npx tsc --noEmit -p packages/shared/tsconfig.json && npx tsc --noEmit -p packages/orchestrator/tsconfig.json && npx tsc --noEmit -p packages/worker/tsconfig.json"
+    "typecheck": "npx tsc --noEmit -p packages/shared/tsconfig.json && npx tsc --noEmit -p packages/orchestrator/tsconfig.json && npx tsc --noEmit -p packages/worker/tsconfig.json",
+    "test": "npx tsx packages/shared/src/bus.test.ts",
+    "test:bus": "npx tsx packages/shared/src/bus.test.ts"
   },
   "devDependencies": {
     "typescript": "^5.7.0",

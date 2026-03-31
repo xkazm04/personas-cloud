@@ -1,0 +1,28 @@
+app = "personas-orchestrator"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  LOG_LEVEL = "info"
+  TLS_ENABLED = "false"
+  HTTP_PORT = "3001"
+  WS_PORT = "8443"
+
+[http_service]
+  internal_port = 3001
+  force_https = true
+  auto_start_machines = true
+  auto_stop_machines = false
+
+[[services]]
+  internal_port = 8443
+  protocol = "tcp"
+  [services.concurrency]
+    type = "connections"
+    hard_limit = 1000
+
+[mounts]
+  source = "personas_data"
+  destination = "/app/data"

@@ -20,8 +20,8 @@ const rowToEvent = createRowMapper<PersonaEvent>({
   errorMessage: { col: 'error_message', nullable: true },
   processedAt: { col: 'processed_at', nullable: true },
   useCaseId: { col: 'use_case_id', nullable: true },
-  retryAfter: { col: 'retry_after', nullable: true },
   retryCount: { col: 'retry_count', default: 0 },
+  nextRetryAt: { col: 'retry_after', nullable: true },
   createdAt: { col: 'created_at' },
 });
 
@@ -30,7 +30,10 @@ export const rowToSubscription = createRowMapper<PersonaEventSubscription>({
   personaId: { col: 'persona_id' },
   eventType: { col: 'event_type' },
   sourceFilter: { col: 'source_filter', nullable: true },
+  payloadFilter: { col: 'payload_filter', nullable: true },
   enabled: { col: 'enabled', bool: true },
+  maxRetries: { col: 'max_retries', default: 3 },
+  retryBackoffMs: { col: 'retry_backoff_ms', default: 5000 },
   useCaseId: { col: 'use_case_id', nullable: true },
   createdAt: { col: 'created_at' },
   updatedAt: { col: 'updated_at' },
@@ -67,8 +70,8 @@ export function publishEvent(db: Database.Database, input: {
     errorMessage: null,
     processedAt: null,
     useCaseId,
-    retryAfter: null,
     retryCount: 0,
+    nextRetryAt: null,
     createdAt: now,
   };
 }
@@ -193,7 +196,10 @@ export function createSubscription(db: Database.Database, input: {
     personaId: input.personaId,
     eventType: input.eventType,
     sourceFilter,
+    payloadFilter: null,
     enabled,
+    maxRetries: 3,
+    retryBackoffMs: 5000,
     useCaseId,
     createdAt: now,
     updatedAt: now,

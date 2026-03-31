@@ -36,6 +36,8 @@ export function createPersonaWithDefaults(input: CreatePersonaInput): Persona {
     maxTurns: input.maxTurns ?? null,
     designContext: input.designContext ?? null,
     groupId: input.groupId ?? null,
+    permissionPolicy: input.permissionPolicy ?? null,
+    webhookSecret: input.webhookSecret ?? null,
     createdAt: input.createdAt ?? now,
     updatedAt: now,
   };

@@ -4,7 +4,6 @@ import { createAuth } from './auth.js';
 import { createTokenManager } from './tokenManager.js';
 import { OAuthManager } from './oauth.js';
 import { WorkerPool, type WorkerPoolEvents } from './workerPool.js';
-import { createKafkaClient, createNoopKafkaClient } from './kafka.js';
 import { Dispatcher } from './dispatcher.js';
 import { createHttpApi } from './httpApi.js';
 import { TenantDbManager } from './tenantDbManager.js';
@@ -17,7 +16,7 @@ import { startRetentionJob } from './retention.js';
 import { startEventProcessor } from './eventProcessor.js';
 import { startTriggerScheduler } from './triggerScheduler.js';
 import { loadTlsConfig } from './tls.js';
-import { TOPICS, projectTopic, type ExecRequest } from '@dac-cloud/shared';
+import { MachinePool } from './machinePool.js';
 
 const logger = pino({ level: process.env['LOG_LEVEL'] || 'info' });
 
@@ -27,10 +26,10 @@ async function main() {
   // Load configuration
   const config = loadConfig();
   logger.info({
-    kafkaEnabled: config.kafkaEnabled,
     wsPort: config.wsPort,
     httpPort: config.httpPort,
     hasDirectToken: !!config.claudeToken,
+    flyMachines: config.flyEnabled,
   }, 'Configuration loaded');
 
   // Initialize components
@@ -59,20 +58,6 @@ async function main() {
     allowedDigests: config.allowedImageDigests,
     rejectUnverified: config.rejectUnverifiedWorkers,
   });
-
-  // Kafka client (deployment ID isolates consumer groups in multi-deployment setups)
-  const kafka = config.kafkaEnabled
-    ? createKafkaClient(
-        config.kafkaBrokers,
-        config.kafkaUsername,
-        config.kafkaPassword,
-        config.kafkaSigningKey,
-        logger,
-        config.kafkaDeploymentId || undefined,
-        config.kafkaBatchSize,
-        config.kafkaLingerMs,
-      )
-    : createNoopKafkaClient(logger);
 
   // Audit log (separate append-only DB)
   const auditLog = new AuditLog(config.auditDbPath, logger);
@@ -109,7 +94,7 @@ async function main() {
   tenantDbManager.setTenantCreatedCallback((tenantId) => tenantKeyManager.warmTenant(tenantId));
 
   // Dispatcher — uses OAuth manager for token refresh
-  const dispatcher = new Dispatcher(pool, tokenManager, oauth, kafka, logger, {
+  const dispatcher = new Dispatcher(pool, tokenManager, oauth, logger, {
     maxQueueDepth: config.maxQueueDepth,
     warningThreshold: config.queueWarningThreshold,
     criticalThreshold: config.queueCriticalThreshold,
@@ -121,48 +106,29 @@ async function main() {
   dispatcher.setTenantKeyManager(tenantKeyManager);
   dispatcher.setAuditLog(auditLog);
 
+  // Fly Machines — on-demand worker VMs (Phase 2)
+  if (config.flyEnabled) {
+    const machinePool = new MachinePool({
+      appName: config.flyAppName,
+      apiToken: config.flyApiToken,
+      region: config.flyRegion,
+      imageRef: config.flyImageRef,
+      orchestratorWsUrl: config.flyOrchestratorWsUrl,
+      workerToken: config.workerToken,
+      cpuKind: config.flyCpuKind,
+      cpus: config.flyCpus,
+      memoryMb: config.flyMemoryMb,
+    }, logger);
+    dispatcher.setMachinePool(machinePool);
+    logger.info({ appName: config.flyAppName, region: config.flyRegion }, 'Fly Machines enabled for on-demand workers');
+  }
+
   // Recover queued executions from DB (crash recovery)
   dispatcher.recoverQueue();
-
-  // Connect Kafka
-  if (config.kafkaEnabled) {
-    await kafka.connect();
-
-    // Subscribe to execution requests (base topic handles requests without projectId)
-    await kafka.subscribe(async (topic: string, value: string) => {
-      try {
-        const request: ExecRequest = JSON.parse(value);
-
-        // Validate that the message's projectId matches the topic it was sent to.
-        const expectedTopic = projectTopic(TOPICS.EXEC_REQUESTS, request.projectId);
-        if (topic !== expectedTopic) {
-          logger.warn({ topic, expectedTopic, projectId: request.projectId, executionId: request.executionId },
-            'ExecRequest projectId does not match topic — dropped');
-          return;
-        }
-
-        const result = dispatcher.submit(request);
-        if (!result.accepted) {
-          logger.warn({ executionId: request.executionId, reason: result.reason }, 'Kafka execution rejected by backpressure, sending to DLQ');
-          await kafka.produce(TOPICS.DLQ, JSON.stringify({
-            originalTopic: TOPICS.EXEC_REQUESTS,
-            reason: result.reason,
-            payload: request,
-            timestamp: Date.now(),
-          }), request.executionId);
-        }
-      } catch (err) {
-        logger.error({ err }, 'Failed to parse execution request from Kafka');
-      }
-    });
-  }
 
   // Load TLS config and start WebSocket server for workers
   const tlsConfig = loadTlsConfig(logger);
   pool.listen(config.wsPort, tlsConfig.enabled ? tlsConfig : undefined);
-
-  // Set master key on Kafka for envelope encryption
-  await kafka.setMasterKey(config.masterKey);
 
   // Start event processor (demand-driven with 30s backstop) — tenant-aware
   const eventProcessor = startEventProcessor(null, dispatcher, logger, 30_000, tenantDbManager);
@@ -173,7 +139,7 @@ async function main() {
   // Start daily retention job (purge old executions/events, aggregate metrics)
   const retentionJob = startRetentionJob(tenantDbManager, config.retentionDays, config.metricsRetentionDays, logger);
 
-  const httpServer = createHttpApi(auth, dispatcher, pool, tokenManager, oauth, logger, undefined, tenantDbManager, tenantKeyManager, auditLog, eventProcessor.getHealth, kafka, eventProcessor.nudge, triggerScheduler, retentionJob.getHealth);
+  const httpServer = createHttpApi(auth, dispatcher, pool, tokenManager, oauth, logger, undefined, tenantDbManager, tenantKeyManager, auditLog, eventProcessor.getHealth, eventProcessor.nudge, triggerScheduler, retentionJob.getHealth, config.corsOrigins, config.corsWildcard, config.trustedProxyCount, config.gitlabWebhookSecret);
   httpServer.listen(config.httpPort, () => {
     logger.info({ port: config.httpPort }, 'HTTP API listening');
   });
@@ -255,7 +221,6 @@ async function main() {
     httpServer.close(); // Stop accepting new HTTP connections first
     dispatcher.shutdown();
     pool.shutdown();
-    await kafka.disconnect();
     tenantKeyManager.close();
     auditChainVerifier.close();
     auditRetention.close();

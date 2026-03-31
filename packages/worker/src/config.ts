@@ -19,6 +19,8 @@ export interface WorkerConfig {
   maxConcurrentExecutions: number;
   /** Grace period (ms) for SIGTERM before force-killing active executions (default 30000). */
   shutdownGracePeriodMs: number;
+  /** When true, worker exits after completing its first execution (Fly Machine mode). */
+  singleExecution: boolean;
 }
 
 function required(name: string): string {
@@ -65,5 +67,6 @@ export function loadConfig(): WorkerConfig {
     healthPort: parseInt(process.env['HEALTH_PORT'] || '0', 10),
     maxConcurrentExecutions: Number.isFinite(maxConcurrent) && maxConcurrent >= 1 ? maxConcurrent : 1,
     shutdownGracePeriodMs: Number.isFinite(gracePeriod) && gracePeriod >= 0 ? gracePeriod : 30_000,
+    singleExecution: process.env['SINGLE_EXECUTION'] === '1',
   };
 }

@@ -6,15 +6,6 @@ export interface OrchestratorConfig {
   claudeToken: string;
   teamApiKey: string;
   workerToken: string;
-  kafkaBrokers: string;
-  kafkaUsername: string;
-  kafkaPassword: string;
-  kafkaSigningKey: string;
-  /** Unique deployment identifier — isolates Kafka consumer groups and client IDs per deployment. */
-  kafkaDeploymentId: string;
-  kafkaEnabled: boolean;
-  kafkaBatchSize: number;
-  kafkaLingerMs: number;
   supabaseJwtSecret: string;
   supabaseProjectRef: string;
   gitlabWebhookSecret: string;
@@ -60,6 +51,16 @@ export interface OrchestratorConfig {
    * is used directly, preventing IP spoofing via header injection.
    */
   trustedProxyCount: number;
+  // Fly Machines (on-demand workers)
+  flyEnabled: boolean;
+  flyAppName: string;
+  flyApiToken: string;
+  flyRegion: string;
+  flyImageRef: string;
+  flyOrchestratorWsUrl: string;
+  flyCpuKind: 'shared' | 'performance';
+  flyCpus: number;
+  flyMemoryMb: number;
 }
 
 function required(name: string): string {
@@ -75,8 +76,6 @@ function optional(name: string, fallback: string): string {
 }
 
 export function loadConfig(): OrchestratorConfig {
-  const kafkaBrokers = process.env['KAFKA_BROKERS'] || '';
-
   const dataDir = process.env['DAC_DATA_DIR'] || path.join(process.cwd(), 'data');
 
   const config: OrchestratorConfig = {
@@ -84,14 +83,6 @@ export function loadConfig(): OrchestratorConfig {
     claudeToken: process.env['CLAUDE_TOKEN'] || '',  // Optional: use OAuth flow if not provided
     teamApiKey: required('TEAM_API_KEY'),
     workerToken: required('WORKER_TOKEN'),
-    kafkaBrokers,
-    kafkaUsername: process.env['KAFKA_USERNAME'] || '',
-    kafkaPassword: process.env['KAFKA_PASSWORD'] || '',
-    kafkaSigningKey: process.env['KAFKA_SIGNING_KEY'] || '',
-    kafkaDeploymentId: process.env['KAFKA_DEPLOYMENT_ID'] || '',
-    kafkaEnabled: kafkaBrokers.length > 0,
-    kafkaBatchSize: parseInt(process.env['KAFKA_BATCH_SIZE'] || '16384', 10),
-    kafkaLingerMs: parseInt(process.env['KAFKA_LINGER_MS'] || '50', 10),
     supabaseJwtSecret: process.env['SUPABASE_JWT_SECRET'] || '',
     supabaseProjectRef: process.env['SUPABASE_PROJECT_REF'] || '',
     gitlabWebhookSecret: process.env['GITLAB_WEBHOOK_SECRET'] || '',
@@ -128,6 +119,16 @@ export function loadConfig(): OrchestratorConfig {
     queueRetryAfterSeconds: parseInt(process.env['QUEUE_RETRY_AFTER_SECONDS'] || '30', 10),
     enableAdminFallback: process.env['ENABLE_ADMIN_FALLBACK'] === '1',
     trustedProxyCount: Math.max(0, parseInt(process.env['TRUSTED_PROXY_COUNT'] || '0', 10) || 0),
+    // Fly Machines
+    flyEnabled: process.env['FLY_MACHINES_ENABLED'] === 'true',
+    flyAppName: process.env['FLY_APP_NAME'] || '',
+    flyApiToken: process.env['FLY_API_TOKEN'] || '',
+    flyRegion: process.env['FLY_REGION'] || 'iad',
+    flyImageRef: process.env['FLY_WORKER_IMAGE'] || '',
+    flyOrchestratorWsUrl: process.env['FLY_ORCHESTRATOR_WS_URL'] || '',
+    flyCpuKind: (process.env['FLY_CPU_KIND'] === 'performance' ? 'performance' : 'shared') as 'shared' | 'performance',
+    flyCpus: parseInt(process.env['FLY_CPUS'] || '1', 10),
+    flyMemoryMb: parseInt(process.env['FLY_MEMORY_MB'] || '1024', 10),
   };
 
   validateConfig(config);
@@ -161,27 +162,12 @@ function validateConfig(config: OrchestratorConfig): void {
     );
   }
 
-  // When Kafka is enabled, credentials, signing key, and deployment ID are required/recommended
-  if (config.kafkaEnabled) {
-    if (!config.kafkaUsername || !config.kafkaPassword) {
-      errors.push(
-        'KAFKA_BROKERS is set but KAFKA_USERNAME and/or KAFKA_PASSWORD are empty — ' +
-        'Kafka SASL authentication will fail. Provide credentials or remove KAFKA_BROKERS to disable Kafka.',
-      );
-    }
-    if (!config.kafkaSigningKey) {
-      errors.push(
-        'KAFKA_SIGNING_KEY is not set — Kafka messages will not be signed or verified. ' +
-        'This is required when Kafka is enabled to prevent message tampering and cross-topic replay attacks. ' +
-        'Set KAFKA_SIGNING_KEY to a random hex string (64 chars).',
-      );
-    }
-    if (!config.kafkaDeploymentId) {
-      warnings.push(
-        'KAFKA_DEPLOYMENT_ID is not set — the consumer group will use a shared identifier. ' +
-        'In multi-deployment environments, set this to a unique value per deployment to isolate consumer groups.',
-      );
-    }
+  // Fly Machines — validate required fields when enabled
+  if (config.flyEnabled) {
+    if (!config.flyAppName) errors.push('FLY_MACHINES_ENABLED=true but FLY_APP_NAME is not set.');
+    if (!config.flyApiToken) errors.push('FLY_MACHINES_ENABLED=true but FLY_API_TOKEN is not set.');
+    if (!config.flyImageRef) errors.push('FLY_MACHINES_ENABLED=true but FLY_WORKER_IMAGE is not set.');
+    if (!config.flyOrchestratorWsUrl) errors.push('FLY_MACHINES_ENABLED=true but FLY_ORCHESTRATOR_WS_URL is not set.');
   }
 
   // Trusted proxy count validation — wrong value silently breaks rate limiting and audit logs

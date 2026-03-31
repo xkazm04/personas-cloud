@@ -55,13 +55,8 @@ export class OrchestratorMetrics {
   // --- Cost tracking ---
   private totalCostUsd = 0;
 
-  // --- Kafka produce stats ---
-  private kafkaProduceSuccess = 0;
-  private kafkaProduceFailure = 0;
-
   // --- Per-sink output error counters (for fan-out write path observability) ---
   private outputDbErrors = 0;
-  private outputKafkaErrors = 0;
 
   // --- Per-persona breakdown ---
   private perPersona = new Map<string, PerPersonaStats>();
@@ -178,17 +173,6 @@ export class OrchestratorMetrics {
     this.outputDbErrors++;
   }
 
-  /** Record an output write error for the Kafka sink. */
-  recordOutputKafkaError(): void {
-    this.outputKafkaErrors++;
-  }
-
-  /** Record a successful Kafka produce. */
-  recordKafkaProduce(success: boolean): void {
-    if (success) this.kafkaProduceSuccess++;
-    else this.kafkaProduceFailure++;
-  }
-
   /** Update queue and worker snapshots (called periodically). */
   updateSnapshots(queueDepth: number, totalSlots: number, availableSlots: number): void {
     this.lastQueueDepth = queueDepth;
@@ -270,13 +254,8 @@ export class OrchestratorMetrics {
           ? Math.round((this.totalCostUsd / this.executionsCompleted) * 1_000_000) / 1_000_000
           : null,
       },
-      kafka: {
-        produceSuccess: this.kafkaProduceSuccess,
-        produceFailure: this.kafkaProduceFailure,
-      },
       outputSinks: {
         dbErrors: this.outputDbErrors,
-        kafkaErrors: this.outputKafkaErrors,
       },
       perPersona: personaBreakdown,
     };
@@ -346,13 +325,8 @@ export class OrchestratorMetrics {
     // Cost
     g('orchestrator_cost_total_usd', 'Total execution cost in USD', Math.round(this.totalCostUsd * 1_000_000) / 1_000_000);
 
-    // Kafka
-    c('orchestrator_kafka_produce_success_total', 'Total successful Kafka produces', this.kafkaProduceSuccess);
-    c('orchestrator_kafka_produce_failure_total', 'Total failed Kafka produces', this.kafkaProduceFailure);
-
     // Per-sink output errors
     c('orchestrator_output_db_errors_total', 'Total DB write errors in output fan-out', this.outputDbErrors);
-    c('orchestrator_output_kafka_errors_total', 'Total Kafka write errors in output fan-out', this.outputKafkaErrors);
 
     // Per-persona execution counts
     for (const [personaId, stats] of this.perPersona) {

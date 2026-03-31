@@ -1,5 +1,13 @@
 import type { Logger } from 'pino';
-import type { ProgressInfo, ProtocolEventType, ExecutionStage, ExecutionProgress } from '@dac-cloud/shared';
+import type { ProtocolEventType, ExecutionStage, ExecutionProgress } from '@dac-cloud/shared';
+
+/** Legacy progress info extracted from inline JSON in assistant text blocks. */
+export interface ProgressInfo {
+  phase: string;
+  percent: number;
+  detail?: string;
+  updatedAt: number;
+}
 import { PROTOCOL_EVENT_KEYS } from '@dac-cloud/shared';
 
 export interface ParsedLine {

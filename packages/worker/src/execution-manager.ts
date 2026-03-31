@@ -1,5 +1,5 @@
 import type { Logger } from 'pino';
-import { Executor, type ResolvedClaudeCommand } from './executor.js';
+import { Executor, type ResolvedClaudeCommand, type ExecutorStatus } from './executor.js';
 
 /**
  * Manages the lifecycle of active executions and provides a unified drain/shutdown contract.
@@ -56,6 +56,16 @@ export class ExecutionManager {
   /** Get the IDs of all currently active executions. */
   getActiveExecutionIds(): string[] {
     return [...this.activeExecutions.keys()];
+  }
+
+  /** Aggregate status across all active executors (for health probes). */
+  getStatus(): ExecutorStatus {
+    if (this.activeExecutions.size > 0) {
+      // Return the status of the first active executor as representative
+      const first = this.activeExecutions.values().next().value;
+      if (first) return first.getStatus();
+    }
+    return { state: 'idle' };
   }
 
   /**

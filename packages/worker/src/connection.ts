@@ -386,9 +386,11 @@ export class Connection {
       this.send({
         type: 'progress',
         executionId,
-        phase: phaseOrProgress,
-        percent: percent ?? 0,
-        detail,
+        stage: phaseOrProgress as import('@dac-cloud/shared').ExecutionStage,
+        percentEstimate: percent ?? 0,
+        activeTool: null,
+        message: detail ?? '',
+        toolCallsCompleted: 0,
         timestamp: Date.now(),
       });
     } else {

@@ -6,7 +6,7 @@ import { ExecutionManager } from './execution-manager.js';
 import { MetricsCollector } from './metrics.js';
 import { installCredentialExitHandler, sweepOrphanedCredentialFiles } from './credentialInjector.js';
 import { startHealthProbe } from './healthProbe.js';
-import type { ExecAssign } from '@dac-cloud/shared';
+import type { ExecAssign, ProtocolEventType } from '@dac-cloud/shared';
 
 const logger = pino({ level: process.env['LOG_LEVEL'] || 'info' });
 
@@ -18,6 +18,7 @@ async function main() {
     workerId: config.workerId,
     orchestratorUrl: config.orchestratorUrl,
     maxConcurrentExecutions: config.maxConcurrentExecutions,
+    singleExecution: config.singleExecution,
   }, 'Configuration loaded');
 
   // Clean up any credential files left behind by a previous crash
@@ -65,7 +66,7 @@ async function main() {
                 connection.sendStderr(msg.executionId, emsg.chunk);
                 break;
               case 'event':
-                connection.sendEvent(msg.executionId, emsg.eventType, emsg.payload);
+                connection.sendEvent(msg.executionId, emsg.eventType as ProtocolEventType, emsg.payload);
                 break;
               case 'progress':
                 connection.sendProgress(msg.executionId, emsg.progress);
@@ -81,7 +82,12 @@ async function main() {
                 connection.sendComplete(msg.executionId, emsg.status, emsg.exitCode, emsg.durationMs, emsg.sessionId, emsg.totalCostUsd);
                 metrics.recordExecution(emsg.durationMs);
                 executionManager.removeExecution(msg.executionId);
-                connection.sendReady(executionManager.availableSlots(), config.maxConcurrentExecutions);
+                if (config.singleExecution) {
+                  logger.info({ executionId: msg.executionId }, 'Single-execution mode — shutting down');
+                  setTimeout(() => shutdown(), 500);
+                } else {
+                  connection.sendReady(executionManager.availableSlots(), config.maxConcurrentExecutions);
+                }
                 break;
             }
           },
@@ -90,7 +96,12 @@ async function main() {
           if (!completed) {
             connection.sendComplete(msg.executionId, 'failed', 1, 0);
             executionManager.removeExecution(msg.executionId);
-            connection.sendReady(executionManager.availableSlots(), config.maxConcurrentExecutions);
+            if (config.singleExecution) {
+              logger.info({ executionId: msg.executionId }, 'Single-execution mode — shutting down after failure');
+              setTimeout(() => shutdown(), 500);
+            } else {
+              connection.sendReady(executionManager.availableSlots(), config.maxConcurrentExecutions);
+            }
           }
         });
       },

@@ -35,8 +35,8 @@ export interface TriggerSchedulerHandle {
   heapRemove(triggerId: string): void;
   /** Return current scheduler metrics for observability. */
   getMetrics(): SchedulerMetrics;
-=======
-import * as db from './db.js';
+}
+
 import { computeNextCron } from './cronParser.js';
 
 /** Minimum allowed interval between trigger firings (60 seconds). */
@@ -126,7 +126,7 @@ export function invalidateTriggerConfigCache(triggerId: string): void {
  * whose time has passed, fires them, and pushes the updated next-fire times
  * back into the heap.  The DB remains the source of truth — the heap is a
  * hot-path cache that eliminates full table scans.
-=======
+ *
  * Runs every `interval` ms (default 5s), evaluates due triggers,
  * and publishes events to the event bus (DB-backed).
  *
@@ -144,11 +144,6 @@ export function startTriggerScheduler(
   let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   let stopped = false;
   const heap = new TriggerHeap();
-=======
-  interval: number = 5000,
-  onTrigger?: () => void,
-): NodeJS.Timeout {
-  logger.info({ intervalMs: interval }, 'Trigger scheduler started');
 
   // ---- Metrics accumulators ----
   let triggersFiredTotal = 0;
@@ -193,8 +188,6 @@ export function startTriggerScheduler(
           errorsSinceHeartbeat[cls] += result.errors[cls];
         }
       }
-=======
-      triggerSchedulerTick(database, logger, onTrigger);
     } catch (err) {
       logger.error({ err }, 'Trigger scheduler tick failed');
     }
@@ -497,7 +490,8 @@ function fireDueEntries(
     }
   }
   return { fired: firedCount, missed: missedCount, errors };
-=======
+}
+
 /** Pre-resolved trigger data computed during the read phase. */
 interface ResolvedTrigger {
   trigger: ReturnType<typeof db.getDueTriggers>[number];

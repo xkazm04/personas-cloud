@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import type { Logger } from 'pino';
 import type { Connection } from './connection.js';
-import type { Executor } from './executor.js';
+import type { ExecutorStatus } from './executor.js';
 import { isSandboxAvailable } from './sandbox.js';
 import { getActiveCredentialFileCount } from './credentialInjector.js';
 
@@ -28,7 +28,7 @@ function getDiskInfo(dirPath: string): DiskInfo | null {
 
 function buildHealthPayload(
   connection: Connection,
-  executor: Executor,
+  executor: { getStatus(): ExecutorStatus },
   workerId: string,
   startTime: number,
 ) {
@@ -62,7 +62,7 @@ function buildHealthPayload(
 export function startHealthProbe(
   port: number,
   connection: Connection,
-  executor: Executor,
+  executor: { getStatus(): ExecutorStatus },
   workerId: string,
   logger: Logger,
 ): http.Server {

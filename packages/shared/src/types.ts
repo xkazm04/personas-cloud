@@ -24,6 +24,8 @@ export interface Persona {
   permissionPolicy: string | null;
   /** HMAC secret for webhook signature verification. Null means webhooks require API key auth. */
   webhookSecret: string | null;
+  /** JSON-encoded ModelProfile for model/provider overrides. */
+  modelProfile?: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -69,7 +71,7 @@ export interface StructuredPrompt {
 // Inference profiles
 // ---------------------------------------------------------------------------
 
-export type InferenceProvider = 'claude' | 'ollama' | 'litellm' | 'openai-compatible' | 'custom';
+export type InferenceProvider = 'anthropic' | 'claude' | 'ollama' | 'litellm' | 'openai-compatible' | 'custom';
 
 export interface InferenceProviderEnvMapping {
   envVar: string;
@@ -99,6 +101,19 @@ export interface InferenceProfile {
  * for backward compatibility. When present, only the listed tools are allowed
  * via `--allowedTools`.
  */
+export interface ModelProfile {
+  /** Claude model identifier override (e.g. "claude-sonnet-4-5-20250514"). */
+  model?: string;
+  /** Optional max tokens for the model. */
+  maxTokens?: number;
+  /** Inference provider (e.g. "ollama", "litellm", "custom"). */
+  provider?: InferenceProvider;
+  /** Base URL for the inference provider endpoint. */
+  baseUrl?: string;
+  /** Authentication token for the inference provider. */
+  authToken?: string;
+}
+
 export interface PermissionPolicy {
   /** Explicit list of Claude CLI tool names to allow (e.g. "Bash", "Read", "Write", "Edit", "Glob", "Grep"). */
   allowedTools?: string[];
@@ -129,11 +144,11 @@ export interface PersonaCredential {
 // ---------------------------------------------------------------------------
 
 /** All valid event statuses. */
-export type EventStatus = 'pending' | 'processing' | 'delivered' | 'skipped' | 'failed' | 'partial' | 'partial-retry';
+export type EventStatus = 'pending' | 'processing' | 'delivered' | 'skipped' | 'failed' | 'partial' | 'partial-retry' | 'dead_letter';
 
 /** All valid EventStatus values as a runtime array (for CHECK constraints, etc.). */
 export const EVENT_STATUSES: readonly EventStatus[] = [
-  'pending', 'processing', 'delivered', 'skipped', 'failed', 'partial', 'partial-retry',
+  'pending', 'processing', 'delivered', 'skipped', 'failed', 'partial', 'partial-retry', 'dead_letter',
 ] as const;
 
 /**
@@ -148,6 +163,7 @@ export const EVENT_TRANSITIONS: Readonly<Record<EventStatus, ReadonlySet<EventSt
   'failed':        new Set<EventStatus>([]),                       // terminal
   'partial':       new Set<EventStatus>(['partial-retry']),        // can retry partial failures
   'partial-retry': new Set<EventStatus>(['processing']),           // retried partial goes back through processing
+  'dead_letter':   new Set<EventStatus>([]),                       // terminal
 };
 
 /**
@@ -201,7 +217,7 @@ export interface PersonaEventSubscription {
 // Trigger config discriminated union
 // ---------------------------------------------------------------------------
 
-export type TriggerType = 'manual' | 'schedule' | 'polling' | 'webhook' | 'chain';
+export type TriggerType = 'manual' | 'schedule' | 'polling' | 'webhook' | 'chain' | 'cron';
 
 interface TriggerConfigBase {
   event_type?: string;
@@ -394,7 +410,7 @@ export interface ReviewRequest {
 }
 
 // ---------------------------------------------------------------------------
-// Execution request — produced to Kafka by Vibeman, consumed by orchestrator
+// Execution request — dispatched to orchestrator for worker execution
 // ---------------------------------------------------------------------------
 
 export interface ExecRequest {
@@ -412,19 +428,6 @@ export interface ExecRequest {
   triggerType?: string;
   /** Originating event ID — enables bidirectional event↔execution tracing. */
   eventId?: string;
-}
-
-// Execution result — produced to Kafka by orchestrator
-export interface ExecResult {
-  executionId: string;
-  personaId: string;
-  status: 'completed' | 'failed' | 'cancelled';
-  exitCode: number;
-  durationMs: number;
-  sessionId?: string;
-  totalCostUsd?: number;
-  phaseTimings?: import('./protocol.js').PhaseTimings;
-  error?: string;
 }
 
 // Worker info as tracked by orchestrator
@@ -448,51 +451,6 @@ export interface WorkerInfo {
   healthMetrics?: import('./protocol.js').WorkerHealthMetrics | null;
 }
 
-// Execution output chunk — produced to Kafka for Vibeman SSE consumption
-export interface OutputChunk {
-  executionId: string;
-  chunk: string;
-  timestamp: number;
-}
-
-// Persona event — forwarded from worker to Kafka event bus
-export interface PersonaCloudEvent {
-  executionId: string;
-  personaId: string;
-  eventType: import('./protocolRegistry.js').ProtocolEventType;
-  payload: unknown;
-  timestamp: number;
-}
-
-// Kafka topic names (base topics — use projectTopic() for per-project isolation)
-export const TOPICS = {
-  EXEC_REQUESTS: 'persona.exec.v1',
-  EXEC_OUTPUT: 'persona.output.v1',
-  EXEC_LIFECYCLE: 'persona.lifecycle.v1',
-  EXEC_PROGRESS: 'persona.progress.v1',
-  EVENTS: 'persona.events.v1',
-  DLQ: 'persona.dlq.v1',
-  QUEUE_METRICS: 'persona.queue_metrics.v1',
-} as const;
-
-/**
- * Returns a project-scoped Kafka topic name.
- * Format: `{baseTopic}.{projectId}` — e.g. `persona.exec.v1.proj_abc123`
- * If projectId is undefined or 'default', returns the base topic unchanged.
- */
-export function projectTopic(baseTopic: string, projectId?: string): string {
-  if (!projectId || projectId === 'default') return baseTopic;
-  return `${baseTopic}.${projectId}`;
-}
-
-/**
- * Extracts the project ID from a scoped topic name, or undefined if it's a base topic.
- */
-export function extractProjectId(topic: string, baseTopic: string): string | undefined {
-  if (!topic.startsWith(baseTopic + '.')) return undefined;
-  const suffix = topic.slice(baseTopic.length + 1);
-  return suffix || undefined;
-}
 
 // ---------------------------------------------------------------------------
 // Compilation API — programmatic persona creation via the design pipeline

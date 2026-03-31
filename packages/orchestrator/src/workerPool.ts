@@ -1,14 +1,11 @@
 import { WebSocketServer, WebSocket } from 'ws';
 import https from 'node:https';
 import crypto from 'node:crypto';
-import fs from 'node:fs';
-import {
-  parseWorkerMessage,
-=======
 import { randomBytes } from 'node:crypto';
+import fs from 'node:fs';
 import { EventEmitter } from 'node:events';
 import {
-  parseMessage,
+  parseWorkerMessage,
   parseSignedEnvelope,
   serializeMessage,
   verifyWorkerPayload,
@@ -23,7 +20,6 @@ import {
   type ExecProgress,
   type WorkerEvent,
   type WorkerBusy,
-=======
   type WorkerReviewRequest,
   type WorkerActiveExecutions,
   type WorkerInfo,
@@ -32,12 +28,6 @@ import type { Logger } from 'pino';
 import type { IncomingMessage } from 'node:http';
 import type { TlsConfig } from './tls.js';
 
-/** Typed event map for WorkerPool → Dispatcher communication. */
-export interface WorkerPoolEvents {
-  'worker-connected': (info: WorkerInfo) => void;
-  'worker-disconnected': (workerId: string, executionId: string | undefined) => void;
-  'worker-ready': (workerId: string) => void;
-=======
 import { safeCompare } from './auth.js';
 
 // ---------------------------------------------------------------------------
@@ -59,7 +49,6 @@ export interface WorkerPoolEvents {
   'persona-event': (workerId: string, msg: WorkerEvent) => void;
   'progress': (workerId: string, msg: ExecProgress) => void;
   'busy': (workerId: string, msg: WorkerBusy) => void;
-=======
   'review-request': (workerId: string, msg: WorkerReviewRequest) => void;
   'executions-reclaimed': (workerId: string, msg: WorkerActiveExecutions) => void;
 }
@@ -102,7 +91,7 @@ function timingSafeTokenEqual(a: string, b: string): boolean {
   }
   return crypto.timingSafeEqual(bufA, bufB);
 }
-=======
+
 /**
  * Grace period for the old connection to flush final **output chunks** before
  * the socket is forcibly closed. This does NOT preserve the execution — all
@@ -124,10 +113,6 @@ interface WorkerEntry {
   lastSeq: number;
 }
 
-export class WorkerPool {
-  private workers = new Map<string, WorkerEntry>();
-  private idleWorkers = new Set<string>();
-=======
 /** Custom close code: duplicate worker ID rejected (WebSocket equivalent of HTTP 409). */
 const WS_CLOSE_DUPLICATE = 4409;
 
@@ -135,12 +120,14 @@ export class WorkerPool extends (EventEmitter as new () => TypedEventEmitter<Wor
   private workers = new Map<string, WorkerEntry>();
   /** Index of workers by their available capacity: availableSlots -> Set of workerIds. */
   private idleByCapacity = new Map<number, Set<string>>();
+  /** Tracks ephemeral Fly Machine workers (auto-created, single-execution). */
+  private machineWorkers = new Set<string>();
   private wss: WebSocketServer | null = null;
   private allowedDigests: string[];
   private rejectUnverified: boolean;
 
   // Typed listener storage — one array per event name
-  private listeners: { [K in keyof WorkerPoolEvents]?: WorkerPoolEvents[K][] } = {};
+  private _listeners: { [K in keyof WorkerPoolEvents]?: WorkerPoolEvents[K][] } = {};
 
   /** Connection lifecycle metrics. */
   private metrics: WorkerPoolMetrics = {
@@ -157,27 +144,29 @@ export class WorkerPool extends (EventEmitter as new () => TypedEventEmitter<Wor
     private logger: Logger,
     opts?: { allowedDigests?: string[]; rejectUnverified?: boolean },
   ) {
+    super();
     this.allowedDigests = opts?.allowedDigests ?? [];
     this.rejectUnverified = opts?.rejectUnverified ?? false;
   }
 
   /** Register a typed event listener. */
-  on<K extends keyof WorkerPoolEvents>(event: K, listener: WorkerPoolEvents[K]): this {
-    if (!this.listeners[event]) {
-      this.listeners[event] = [];
+  override on<K extends keyof WorkerPoolEvents>(event: K, listener: WorkerPoolEvents[K]): this {
+    if (!this._listeners[event]) {
+      this._listeners[event] = [];
     }
-    this.listeners[event]!.push(listener);
+    this._listeners[event]!.push(listener);
     return this;
   }
 
   /** Emit a typed event. */
-  private emit<K extends keyof WorkerPoolEvents>(event: K, ...args: Parameters<WorkerPoolEvents[K]>): void {
-    const fns = this.listeners[event];
+  override emit<K extends keyof WorkerPoolEvents & string>(event: K, ...args: WorkerPoolEvents[K] extends (...args: infer A) => void ? A : never): boolean {
+    const fns = this._listeners[event];
     if (fns) {
       for (const fn of fns) {
-        (fn as (...a: Parameters<WorkerPoolEvents[K]>) => void)(...args);
+        (fn as (...a: unknown[]) => void)(...args);
       }
     }
+    return !!fns && fns.length > 0;
   }
 
   listen(port: number, tlsConfig?: TlsConfig): void {
@@ -197,19 +186,6 @@ export class WorkerPool extends (EventEmitter as new () => TypedEventEmitter<Wor
       this.logger.info({ port, tls: false }, 'Worker pool listening (WS — plaintext)');
     }
 
-    this.wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
-      this.logger.info({ remoteAddr: req.socket.remoteAddress }, 'Worker connection attempt');
-
-      // Validate worker token from Authorization header (timing-safe comparison)
-      const authHeader = req.headers.authorization;
-      const token = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : null;
-      if (!token || !timingSafeTokenEqual(token, this.expectedWorkerToken)) {
-        this.logger.warn({ remoteAddr: req.socket.remoteAddress }, 'Worker rejected: invalid token');
-        ws.close(1008, 'Invalid worker token');
-        return;
-      }
-
-=======
     this.wss.on('connection', (ws: WebSocket, _req: IncomingMessage) => {
       // Token is no longer extracted from the URL query string — it is sent
       // inside the hello message to avoid exposing secrets in proxy/CDN logs.
@@ -236,27 +212,6 @@ export class WorkerPool extends (EventEmitter as new () => TypedEventEmitter<Wor
     }, 10_000);
 
     ws.on('message', (raw: Buffer) => {
-      const msg = parseWorkerMessage(raw.toString());
-      if (!msg) {
-        this.metrics.parseFailures++;
-        this.logger.warn({ parseFailures: this.metrics.parseFailures }, 'Invalid message from worker');
-        return;
-      }
-
-      if (msg.type === 'hello') {
-        clearTimeout(connectionTimeout);
-        workerId = msg.workerId;
-        this.registerWorker(workerId, ws, msg.version, msg.capabilities, msg.imageDigest, msg.claudeCliVersion);
-        return;
-      }
-
-      if (!workerId) {
-        this.logger.warn({ type: msg.type }, 'Message before hello');
-        return;
-      }
-
-      this.handleWorkerMessage(workerId, msg);
-=======
       const rawStr = raw.toString();
 
       // Try to parse as a signed envelope first
@@ -280,7 +235,7 @@ export class WorkerPool extends (EventEmitter as new () => TypedEventEmitter<Wor
           }
         }
 
-        const msg = parseMessage<WorkerMessage>(envelope.payload);
+        const msg = parseWorkerMessage(envelope.payload);
         if (!msg) {
           this.logger.warn({ workerId }, 'Invalid message payload inside signed envelope');
           return;
@@ -329,9 +284,6 @@ export class WorkerPool extends (EventEmitter as new () => TypedEventEmitter<Wor
     });
   }
 
-  private registerWorker(workerId: string, ws: WebSocket, version: string, capabilities: string[], imageDigest?: string, claudeCliVersion?: string): void {
-    // I10: If a worker with this ID already exists, disconnect the old one first
-=======
   /**
    * Validate the worker token sent in the hello message.
    * Returns true if the token matches; closes the socket and returns false otherwise.
@@ -425,16 +377,7 @@ export class WorkerPool extends (EventEmitter as new () => TypedEventEmitter<Wor
       // Remove from idle index before deleting
       this.syncIdleIndex(workerId, existing.info.availableSlots, 0);
       this.workers.delete(workerId);
-      this.idleWorkers.delete(workerId);
-    }
 
-    const verified = this.allowedDigests.length === 0 || (!!imageDigest && this.allowedDigests.includes(imageDigest));
-
-    if (this.rejectUnverified && !verified) {
-      this.logger.warn({ workerId, imageDigest }, 'Rejecting unverified worker — digest not in allowlist');
-      ws.close(1008, 'Unverified image digest');
-      return;
-=======
       setTimeout(() => {
         if (oldWs.readyState === WebSocket.OPEN || oldWs.readyState === WebSocket.CONNECTING) {
           oldWs.close(1001, 'Replaced by reconnection');
@@ -452,9 +395,7 @@ export class WorkerPool extends (EventEmitter as new () => TypedEventEmitter<Wor
       availableSlots: 1,
       connectedAt: Date.now(),
       lastHeartbeat: Date.now(),
-      imageDigest,
-      claudeCliVersion,
-      verified,
+      verified: this.allowedDigests.length === 0,
     };
 
     const heartbeatTimer = setInterval(() => {
@@ -477,11 +418,8 @@ export class WorkerPool extends (EventEmitter as new () => TypedEventEmitter<Wor
       this.send(workerId, { type: 'heartbeat', timestamp: Date.now() });
     }, HEARTBEAT_INTERVAL_MS);
 
-    this.workers.set(workerId, { ws, info, heartbeatTimer });
-    this.idleWorkers.add(workerId);
-    this.metrics.totalConnections++;
-=======
     this.workers.set(workerId, { ws, info, heartbeatTimer, lastSeq: 0 });
+    this.metrics.totalConnections++;
 
     // Invariant: a newly registered worker always starts with zero active
     // executions.  This assertion guards against future code paths that might
@@ -506,7 +444,12 @@ export class WorkerPool extends (EventEmitter as new () => TypedEventEmitter<Wor
       protocolVersion: PROTOCOL_VERSION,
     });
 
-    this.logger.info({ workerId, version, capabilities, imageDigest, claudeCliVersion, verified }, 'Worker registered');
+    // Track ephemeral Fly Machine workers
+    if (workerId.startsWith('fly-')) {
+      this.machineWorkers.add(workerId);
+    }
+
+    this.logger.info({ workerId, version, capabilities, flyMachine: workerId.startsWith('fly-') }, 'Worker registered');
     this.emit('worker-connected', info);
   }
 
@@ -524,11 +467,7 @@ export class WorkerPool extends (EventEmitter as new () => TypedEventEmitter<Wor
       clearInterval(entry.heartbeatTimer);
     }
 
-    const hadExecution = entry.info.currentExecutionId;
     const connectionDurationMs = Date.now() - entry.info.connectedAt;
-
-    this.workers.delete(workerId);
-    this.idleWorkers.delete(workerId);
     this.metrics.totalDisconnections++;
 
     // Track recent connection durations (ring buffer)
@@ -537,15 +476,15 @@ export class WorkerPool extends (EventEmitter as new () => TypedEventEmitter<Wor
       this.metrics.recentConnectionDurations.shift();
     }
 
-    this.logger.info({ workerId, hadExecution, connectionDurationMs }, 'Worker disconnected');
-    this.emit('worker-disconnected', workerId, hadExecution);
-=======
     const activeExecutionIds = [...entry.info.currentExecutionIds];
     // Remove from idle index
     this.syncIdleIndex(workerId, entry.info.availableSlots, 0);
     this.workers.delete(workerId);
 
-    this.logger.info({ workerId, activeExecutionIds }, 'Worker disconnected');
+    // Clean up Fly Machine tracking
+    this.machineWorkers.delete(workerId);
+
+    this.logger.info({ workerId, activeExecutionIds, flyMachine: workerId.startsWith('fly-') }, 'Worker disconnected');
     // Emit disconnect for each active execution so dispatcher can handle them
     for (const executionId of activeExecutionIds) {
       this.emit('worker-disconnected', workerId, executionId);
@@ -568,11 +507,6 @@ export class WorkerPool extends (EventEmitter as new () => TypedEventEmitter<Wor
         }
         break;
 
-      case 'ready':
-        entry.info.status = 'idle';
-        entry.info.currentExecutionId = undefined;
-        this.idleWorkers.add(workerId);
-=======
       case 'ready': {
         // Update capacity info from worker
         const availableSlots = msg.availableSlots ?? 1;
@@ -598,11 +532,6 @@ export class WorkerPool extends (EventEmitter as new () => TypedEventEmitter<Wor
         this.emit('stderr', workerId, msg);
         break;
 
-      case 'complete':
-        entry.info.status = 'idle';
-        entry.info.currentExecutionId = undefined;
-        this.idleWorkers.add(workerId);
-=======
       case 'complete': {
         if (!this.validateExecutionOwnership(workerId, entry, msg.executionId)) return;
         // Remove completed execution from tracking
@@ -620,7 +549,6 @@ export class WorkerPool extends (EventEmitter as new () => TypedEventEmitter<Wor
           status: msg.status,
           durationMs: msg.durationMs,
           ...(msg.phaseTimings ? { phaseTimings: msg.phaseTimings } : {}),
-=======
           remainingExecutions: entry.info.currentExecutionIds.length,
           availableSlots: entry.info.availableSlots,
         }, 'Execution complete');
@@ -634,22 +562,22 @@ export class WorkerPool extends (EventEmitter as new () => TypedEventEmitter<Wor
         break;
 
       case 'progress':
-        this.emit('progress', workerId, msg);
-        break;
-
-      case 'busy':
-        this.logger.warn({ workerId, executionId: msg.executionId, reason: msg.reason }, 'Worker rejected assignment (busy)');
-        // Mark worker as idle again so it can receive future work once it finishes
-        entry.info.status = 'idle';
-        entry.info.currentExecutionId = undefined;
-        this.idleWorkers.add(workerId);
-        this.emit('busy', workerId, msg);
-        break;
-
-=======
         if (!this.validateExecutionOwnership(workerId, entry, msg.executionId)) return;
         this.emit('progress', workerId, msg);
         break;
+
+      case 'busy': {
+        this.logger.warn({ workerId, executionId: msg.executionId, reason: msg.reason }, 'Worker rejected assignment (busy)');
+        // Remove the rejected execution from tracking and update capacity
+        const oldAvailableBusy = entry.info.availableSlots;
+        const busyIdx = entry.info.currentExecutionIds.indexOf(msg.executionId);
+        if (busyIdx !== -1) entry.info.currentExecutionIds.splice(busyIdx, 1);
+        entry.info.availableSlots = entry.info.maxConcurrentSlots - entry.info.currentExecutionIds.length;
+        entry.info.status = entry.info.currentExecutionIds.length === 0 ? 'idle' : 'executing';
+        this.syncIdleIndex(workerId, oldAvailableBusy, entry.info.availableSlots);
+        this.emit('busy', workerId, msg);
+        break;
+      }
 
       case 'review_request':
         if (!this.validateExecutionOwnership(workerId, entry, msg.executionId)) return;
@@ -754,15 +682,6 @@ export class WorkerPool extends (EventEmitter as new () => TypedEventEmitter<Wor
     entry.info.currentExecutionIds.push(assignment.executionId);
     entry.info.availableSlots = entry.info.maxConcurrentSlots - entry.info.currentExecutionIds.length;
     entry.info.status = 'executing';
-    entry.info.currentExecutionId = assignment.executionId;
-    this.idleWorkers.delete(workerId);
-    return this.send(workerId, assignment);
-  }
-
-  getIdleWorker(): string | null {
-    const first = this.idleWorkers.values().next();
-    return first.done ? null : first.value;
-=======
 
     this.syncIdleIndex(workerId, oldAvailable, entry.info.availableSlots);
     return true;
@@ -801,16 +720,11 @@ export class WorkerPool extends (EventEmitter as new () => TypedEventEmitter<Wor
 
     const set = this.idleByCapacity.get(max)!;
     // Return the first worker from the set
-    return set.values().next().value || null;
+    return set.values().next().value ?? null;
   }
 
   getWorkers(): WorkerInfo[] {
     return Array.from(this.workers.values()).map(e => ({ ...e.info }));
-  }
-
-  getWorkerCount(): { total: number; idle: number; executing: number } {
-    const idle = this.idleWorkers.size;
-    return { total: this.workers.size, idle, executing: this.workers.size - idle };
   }
 
   getMetrics(): WorkerPoolMetrics {
@@ -828,8 +742,19 @@ export class WorkerPool extends (EventEmitter as new () => TypedEventEmitter<Wor
       }
     }
     return stale;
-=======
-  getWorkerCount(): { total: number; idle: number; executing: number; totalSlots: number; availableSlots: number } {
+  }
+
+  /** Check if a worker is an ephemeral Fly Machine. */
+  isFlyMachine(workerId: string): boolean {
+    return this.machineWorkers.has(workerId);
+  }
+
+  /** Count of currently connected Fly Machine workers. */
+  get flyMachineCount(): number {
+    return this.machineWorkers.size;
+  }
+
+  getWorkerCount(): { total: number; idle: number; executing: number; totalSlots: number; availableSlots: number; flyMachines: number } {
     let idle = 0;
     let executing = 0;
     let totalSlots = 0;
@@ -840,7 +765,7 @@ export class WorkerPool extends (EventEmitter as new () => TypedEventEmitter<Wor
       totalSlots += entry.info.maxConcurrentSlots;
       availableSlots += entry.info.availableSlots;
     }
-    return { total: this.workers.size, idle, executing, totalSlots, availableSlots };
+    return { total: this.workers.size, idle, executing, totalSlots, availableSlots, flyMachines: this.machineWorkers.size };
   }
 
   shutdown(): void {
